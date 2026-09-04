@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // SLOW GATE. Loads the shipped single file over file:// in headless Chromium,
-// drives it with REAL keyboard events, and reads state back through window.__game.
+// drives it with REAL keyboard and mouse events, and reads state back through
+// window.__game.
 //   npm i puppeteer && node tools/verify-browser.mjs [--log=browser-gate.log]
 //
 // Runs in CI only (needs a browser download). Every threshold below cites where
@@ -238,6 +239,7 @@ metrics.autopilotPollMs = Math.round(24000 / Math.max(1, run.samples));
 // pure core reaches platform 23 / 23.6m in 24s with zero falls, and holds 22-23
 // across every poll interval from 20ms to 140ms. Floors are half that. The 24s
 // budget includes ~4s of walking across the farmyard before the first jump.
+// CI on 2026-09-04 measured 23 / 23.42m, so the offline predictor is trustworthy.
 const CLIMB_IDX_FLOOR = 11;
 const CLIMB_Y_FLOOR = 11;
 const climbed = run.maxIdx >= CLIMB_IDX_FLOOR && run.end.bestY >= CLIMB_Y_FLOOR;
@@ -254,52 +256,100 @@ record('loop:fps-alive', after.fps > 5,
 // --- mouse look, the other thing v1.0 got wrong -------------------------------
 // A page only receives mouse movement continuously while the pointer is LOCKED;
 // without a lock it sees the cursor but the camera cannot follow it, which is why
-// v1.0 needed click-and-drag. Both paths are exercised and the report says which,
-// because "pointer lock was not granted" and "mouse look is broken" must not look
-// the same.
-const yaw0 = await page.evaluate(() => window.__game.camYaw);
-await page.mouse.click(640, 400);                      // a real gesture: arms the lock
-await sleep(300);
+// v1.0 needed click-and-drag. Both paths exist, so both are tested -- but SEPARATELY.
+//
+// The first version tested them in one block and produced two nonsense failures.
+// Three things were wrong with it, all in the test:
+//   1. It dispatched MouseEvents on `window`, while the shell listens for
+//      mousedown on the CANVAS. An event dispatched on window has window as its
+//      target and never reaches a child element, so `dragging` never became true
+//      and pitch never moved. The check was driving nothing.
+//   2. It reused ONE detail string for pass and fail, so the report read
+//      "[FAIL] ... pitch stayed inside [0.02, 1.15] and the two extremes differ"
+//      -- a failure message describing success. Every record() below now prints
+//      the measured numbers instead of a fixed sentence.
+//   3. It exited pointer lock and immediately dragged, but releasing the button
+//      fires a click, which re-arms the lock. The two input paths read different
+//      event fields (movementX vs clientX), so interleaving them measured a mix
+//      of both. Each path is now measured in its own isolated window.
+// See docs/PITFALLS.md.
+
+// Helper: drag on the CANVAS with real events, returning the camera delta.
+// Measured before mouseup on purpose, so the click that re-arms pointer lock
+// cannot contaminate the reading.
+async function dragBy(page, from, to, steps = 10) {
+  const before = await page.evaluate(() => ({ yaw: window.__game.camYaw, pitch: window.__game.camPitch }));
+  await page.mouse.move(from[0], from[1]);
+  await page.mouse.down();
+  await page.mouse.move(to[0], to[1], { steps });
+  const mid = await page.evaluate(() => ({ yaw: window.__game.camYaw, pitch: window.__game.camPitch, locked: window.__game.pointerLocked }));
+  await page.mouse.up();
+  return { before, after: mid, dYaw: mid.yaw - before.yaw, dPitch: mid.pitch - before.pitch, locked: mid.locked };
+}
+
+// A. pointer lock path. Click to arm, then move with no button held.
+const yawBeforeLock = await page.evaluate(() => window.__game.camYaw);
+await page.mouse.click(640, 400);
+await sleep(350);
 const locked = await page.evaluate(() => window.__game.pointerLocked);
 metrics.pointerLockGranted = locked;
-await page.mouse.move(640, 400);
-await page.mouse.move(900, 470);                       // no button held
-await sleep(200);
-const yawLock = await page.evaluate(() => window.__game.camYaw);
-const lockTurned = Math.abs(yawLock - yaw0) > 0.05;
-
-// drag fallback, which must work whether or not the lock was granted
-await page.evaluate(() => { if (document.exitPointerLock) document.exitPointerLock(); });
-await sleep(200);
-const yaw1 = await page.evaluate(() => window.__game.camYaw);
-const p1 = await page.evaluate(() => window.__game.camPitch);
 await page.mouse.move(500, 400);
-await page.mouse.down();
-await page.mouse.move(760, 300, { steps: 8 });
-await page.mouse.up();
+await sleep(80);
+await page.mouse.move(860, 400);          // horizontal only: isolates yaw
 await sleep(150);
-const after2 = await page.evaluate(() => ({ yaw: window.__game.camYaw, pitch: window.__game.camPitch }));
-const dragYaw = Math.abs(after2.yaw - yaw1), dragPitch = Math.abs(after2.pitch - p1);
-metrics.dragYawDelta = +dragYaw.toFixed(3);
-metrics.dragPitchDelta = +dragPitch.toFixed(3);
-record('input:mouse-look-turns-the-camera',
-  (locked ? lockTurned : true) && dragYaw > 0.2 && dragPitch > 0.05,
+const lockYawDelta = Math.abs(await page.evaluate(() => window.__game.camYaw) - yawBeforeLock);
+metrics.lockYawDelta = +lockYawDelta.toFixed(3);
+record('input:pointer-lock-look',
+  locked ? lockYawDelta > 0.1 : true,
   locked
-    ? `pointer lock GRANTED: bare mouse movement moved yaw by ${Math.abs(yawLock - yaw0).toFixed(3)} rad. Drag fallback also works (yaw ${dragYaw.toFixed(2)}, pitch ${dragPitch.toFixed(2)}).`
-    : `pointer lock NOT granted by this headless browser, so continuous look was NOT verified this run; the drag fallback was (yaw ${dragYaw.toFixed(2)} rad, pitch ${dragPitch.toFixed(2)} rad). Lock is the path a real Edge session takes.`);
+    ? `lock GRANTED and bare mouse movement turned the camera by ${lockYawDelta.toFixed(3)} rad (floor 0.1). This is the path a real Edge session takes.`
+    : `lock NOT granted by this headless browser, so continuous look was NOT verified this run (yaw moved ${lockYawDelta.toFixed(3)} rad). The drag fallback below was verified; only a real browser settles this one.`);
 
-record('input:camera-pitch-is-clamped', await page.evaluate(async () => {
-  const ev = function (t, o) { window.dispatchEvent(new MouseEvent(t, o)); };
-  ev('mousedown', { clientX: 500, clientY: 400, bubbles: true });
-  for (let i = 0; i < 60; i++) ev('mousemove', { clientX: 500, clientY: 400 + i * 40, bubbles: true });
-  ev('mouseup', {});
-  const hi = window.__game.camPitch;
-  ev('mousedown', { clientX: 500, clientY: 4000, bubbles: true });
-  for (let i = 0; i < 60; i++) ev('mousemove', { clientX: 500, clientY: 4000 - i * 40, bubbles: true });
-  ev('mouseup', {});
-  const lo = window.__game.camPitch;
-  return hi <= 1.15 + 1e-9 && lo >= 0.02 - 1e-9 && hi > lo;
-}), 'dragged hard past both limits: pitch stayed inside [0.02, 1.15] and the two extremes differ');
+// B. drag fallback, in isolation, with the lock definitely released.
+await page.evaluate(() => { if (document.exitPointerLock) document.exitPointerLock(); });
+await sleep(250);
+const stillLocked = await page.evaluate(() => window.__game.pointerLocked);
+const dragX = await dragBy(page, [400, 400], [760, 400]);   // horizontal: yaw
+metrics.dragYawDelta = +dragX.dYaw.toFixed(3);
+record('input:drag-look-turns-yaw', !stillLocked && Math.abs(dragX.dYaw) > 0.2,
+  stillLocked
+    ? 'pointer lock was still held after exitPointerLock(), so this measured the lock path rather than the drag path'
+    : `dragged 360px horizontally on the canvas: yaw ${dragX.before.yaw.toFixed(3)} \u2192 ${dragX.after.yaw.toFixed(3)} (\u0394 ${dragX.dYaw.toFixed(3)} rad, floor 0.2), pitch untouched at ${dragX.after.pitch.toFixed(3)}`);
+
+// C. pitch responds to vertical drag. Direction is not asserted: the starting
+//    pitch depends on everything above, so a run that begins near a clamp can
+//    legitimately only move one way. Magnitude is what matters.
+await sleep(120);
+const dragY = await dragBy(page, [640, 200], [640, 620]);   // vertical: pitch
+metrics.dragPitchDelta = +dragY.dPitch.toFixed(3);
+record('input:drag-look-turns-pitch', Math.abs(dragY.dPitch) > 0.1,
+  `dragged 420px vertically: pitch ${dragY.before.pitch.toFixed(3)} \u2192 ${dragY.after.pitch.toFixed(3)} (\u0394 ${dragY.dPitch.toFixed(3)}, floor 0.1); yaw moved ${dragY.dYaw.toFixed(3)}`);
+
+// D. the clamp itself. Drag far past both limits and require the bounds to hold.
+//    Separately require that the two extremes DIFFER, otherwise a camera frozen
+//    at one value would pass a bounds check trivially.
+//
+//    One 600px drag is worth 1.08 rad of pitch, which is not guaranteed to
+//    saturate a [0.02, 1.15] range from an arbitrary start, so each direction gets
+//    two drags. The report says whether it actually reached the stop rather than
+//    claiming it did.
+const PITCH_MIN = 0.02, PITCH_MAX = 1.15;
+for (let i = 0; i < 2; i++) { await dragBy(page, [640, 100], [640, 700], 20); await sleep(80); }
+const hi = await page.evaluate(() => window.__game.camPitch);
+await sleep(120);
+for (let i = 0; i < 2; i++) { await dragBy(page, [640, 700], [640, 100], 20); await sleep(80); }
+const lo = await page.evaluate(() => window.__game.camPitch);
+metrics.pitchAfterMaxDrag = +hi.toFixed(4);
+metrics.pitchAfterMinDrag = +lo.toFixed(4);
+const inBounds = hi <= PITCH_MAX + 1e-9 && lo >= PITCH_MIN - 1e-9;
+const moved = hi - lo > 0.2;
+record('input:camera-pitch-is-clamped', inBounds && moved,
+  !inBounds
+    ? `pitch escaped its limits: after slamming down it read ${hi.toFixed(4)} (max ${PITCH_MAX}), after slamming up ${lo.toFixed(4)} (min ${PITCH_MIN})`
+    : !moved
+      ? `pitch barely moved between the two extremes (${lo.toFixed(4)} vs ${hi.toFixed(4)}, need >0.2 apart) \u2014 the bounds check would pass on a frozen camera, so it proves nothing`
+      : `slammed 1200px each way: pitch reached ${hi.toFixed(4)} then ${lo.toFixed(4)}, both inside [${PITCH_MIN}, ${PITCH_MAX}], ${(hi - lo).toFixed(3)} apart. ` +
+        `Stops actually hit: max ${Math.abs(hi - PITCH_MAX) < 1e-6 ? 'YES' : 'no, stopped short'}, min ${Math.abs(lo - PITCH_MIN) < 1e-6 ? 'YES' : 'no, stopped short'}.`);
 
 // 8. HUD is wired to state, not just decorative
 const hud = await page.evaluate(() => ({
