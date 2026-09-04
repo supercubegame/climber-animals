@@ -1,45 +1,73 @@
-// Camera + projection. Lives in the PURE CORE (no DOM, no canvas) precisely so
-// the fast gate can assert where things land on screen. The previous version of
-// this maths lived in the shell where nothing could test it, carried a comment
-// claiming it was "derived, not guessed", and was wrong: see docs/PITFALLS.md.
+// Camera + projection. PURE (no DOM, no canvas) so the fast gate can assert where
+// things land on screen. v1.0 kept this in the shell where nothing could test it,
+// carried a comment claiming it was "derived, not guessed", and was wrong.
 
 export const CAM_FOV = 0.52;           // half-angle, radians
-export const CAM_TARGET_LIFT = 1.25;   // aim above the animal's feet
+export const CAM_TARGET_LIFT = 1.25;
 export const CAM_DIST_MIN = 5;
 export const CAM_DIST_MAX = 16;
 export const CAM_DIST_DEFAULT = 9.2;
-// Pitch is how far ABOVE the target the camera sits. 0 = level with it.
-// Upper bound stops short of straight down, where yaw becomes meaningless.
-export const CAM_PITCH_MIN = 0.02;
-export const CAM_PITCH_MAX = 1.15;
-export const CAM_PITCH_DEFAULT = 0.30;
-export const MOUSE_SENS_X = 0.0024;    // radians per pixel of pointer movement
+
+// Pitch is how far ABOVE the target the eye sits, so the eye always looks DOWN by
+// that angle. v2.1 clamped it to [0.02, 1.15] and that is why the view could never
+// tilt up: the horizon sits at H/2 - focal*tan(pitch), so pitch 0.02 was the most
+// sky you could ever get (48% of the frame) and the 0.30 default gave 23%. Above
+// horizontal was simply unreachable.
+//
+// NEGATIVE pitch (eye BELOW the target, looking up) is now allowed. But there is a
+// hard geometric limit that no clamp constant can wish away: with the eye orbiting
+// at `dist`, looking up far enough puts it UNDERGROUND. So the floor is computed
+// per frame from the target height (see pitchFloorFor) and the constant below is
+// only the outer bound. On flat ground that floor is around -0.05 rad, which is
+// why FIRST PERSON exists -- it is the only way to look at the sky from ground
+// level, not a cosmetic extra.
+export const CAM_PITCH_MIN = -0.55;
+export const CAM_PITCH_MAX = 1.30;
+export const CAM_PITCH_DEFAULT = 0.26;
+
+// First person pitches freely: the eye is at the animal's head, so there is no
+// orbit arm to swing underground.
+export const FP_PITCH_MIN = -1.25;
+export const FP_PITCH_MAX = 1.25;
+
+export const MOUSE_SENS_X = 0.0024;
 export const MOUSE_SENS_Y = 0.0018;
 
 /**
- * Which way a pointer delta turns the camera. Derived, and this time actually
- * checked: the forward vector is (sin yaw cos p, -sin p, cos yaw cos p), so
- * d/dyaw of its horizontal part is (cos yaw, 0, -sin yaw) -- which projects to
- * SCREEN RIGHT. Therefore increasing yaw pans right, and mouse-right must ADD.
- *
- * v2.0 shipped `camYaw -= dx` and felt inverted. `Q`/`E` were correct, so the two
- * input paths disagreed with each other, which is the tell. `camera:mouse-yaw-sign`
- * pins it by projecting a probe point instead of trusting a comment.
+ * Which way a pointer delta turns the camera. d/dyaw of the forward vector's
+ * horizontal part is (cos yaw, 0, -sin yaw), which projects to SCREEN RIGHT, so
+ * increasing yaw pans right and mouse-right must ADD. v2.0 subtracted and felt
+ * inverted while Q/E were correct -- two paths for one action disagreeing.
  */
-export const YAW_PER_PIXEL = MOUSE_SENS_X;    // add this * dx to yaw
-export const PITCH_PER_PIXEL = MOUSE_SENS_Y;  // add this * dy to pitch (mouse down = look down)
+export const YAW_PER_PIXEL = MOUSE_SENS_X;
+export const PITCH_PER_PIXEL = MOUSE_SENS_Y;
 
 export const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
-export const clampPitch = (p) => clamp(p, CAM_PITCH_MIN, CAM_PITCH_MAX);
 export const clampDist = (d) => clamp(d, CAM_DIST_MIN, CAM_DIST_MAX);
 export const focalFor = (h) => (h / 2) / Math.tan(CAM_FOV);
 
 /**
- * Orbit position: `dist` away from the target, `pitch` above it, `yaw` around it.
- * The forward unit vector eye->target is therefore
- *     (sin yaw · cos pitch, -sin pitch, cos yaw · cos pitch)
- * which is what the rotation below has to map onto +Z.
+ * How far up you may tilt before the orbiting eye would sink below `groundY`.
+ * Keeping the eye above ground preserves the dead-centre invariant (the orbit stays
+ * exact) instead of shoving the eye and silently decentring the animal, which is
+ * what a naive "clamp the eye height" fix does.
  */
+export function pitchFloorFor(targetY, dist, groundY, margin = 0.45) {
+  const s = (groundY + margin - targetY) / Math.max(dist, 1e-6);
+  if (s <= -1) return CAM_PITCH_MIN;
+  if (s >= 1) return CAM_PITCH_MAX;
+  return Math.max(CAM_PITCH_MIN, Math.asin(s));
+}
+
+export function clampPitch(p, lo = CAM_PITCH_MIN, hi = CAM_PITCH_MAX) {
+  return clamp(p, lo, hi);
+}
+
+/** Screen y of the horizon. The number that proves whether you can look up at all. */
+export function horizonY(pitch, h) {
+  return h / 2 - focalFor(h) * Math.tan(pitch);
+}
+
 export function cameraEye(tx, ty, tz, yaw, pitch, dist) {
   const cp = Math.cos(pitch);
   return {
@@ -50,19 +78,13 @@ export function cameraEye(tx, ty, tz, yaw, pitch, dist) {
 }
 
 /**
- * World -> camera space. Yaw about +Y, then pitch about +X, chosen so that the
- * forward vector above lands exactly on (0, 0, dist).
+ * World -> camera space. Yaw about +Y then pitch about +X, chosen so the forward
+ * vector (sin yaw cos p, -sin p, cos yaw cos p) lands exactly on (0, 0, dist).
  *
- * Yaw:   x1 = dx·cos y − dz·sin y      z1 = dx·sin y + dz·cos y
- *   forward gives x1 = cp(sin y cos y − cos y sin y) = 0, z1 = cp = cos pitch.
- * Pitch: y2 = dy·cos p + z1·sin p      z2 = −dy·sin p + z1·cos p
- *   with dy = −sin p·dist: y2 = dist(−sin p cos p + cos p sin p) = 0
- *                          z2 = dist(sin²p + cos²p) = dist
- *
- * THE PITCH SIGNS ARE THE WHOLE BUG. Flip them (y2 = dy·cos p − z1·sin p) and
- * the camera still sits above the target but tilts further UP, throwing the
- * target off the bottom of the viewport while the scene still looks plausible.
- * `camera:target-lands-dead-centre` pins this down; a mutant proves it fails.
+ * Pitch: y2 = dy*cos p + z1*sin p,  z2 = -dy*sin p + z1*cos p
+ * THE PITCH SIGNS ARE THE v1.0 BUG. Flip them and the camera still sits above the
+ * target but tilts further UP, throwing it off the bottom of the viewport while the
+ * scene still looks plausible.
  */
 export function toCameraSpace(px, py, pz, eye, yaw, pitch, out) {
   const dx = px - eye.x, dy = py - eye.y, dz = pz - eye.z;
@@ -78,25 +100,34 @@ export function toCameraSpace(px, py, pz, eye, yaw, pitch, out) {
 
 export const NEAR_Z = 0.12;
 
-/**
- * Builds everything a frame needs, so the shell keeps no camera maths of its own.
- * `lift` is how far above the feet to aim; it defaults to CAM_TARGET_LIFT but the
- * shell scales it with the animal's height, because framing a chicken and framing
- * a cow at the same aim point puts one of them in the wrong half of the screen.
- */
+/** Third person: eye orbits a target, target lands dead centre. */
 export function makeView(tx, ty, tz, yaw, pitch, dist, w, h, lift) {
   const L = lift === undefined ? CAM_TARGET_LIFT : lift;
   return {
     eye: cameraEye(tx, ty + L, tz, yaw, pitch, dist),
-    yaw, pitch, dist, w, h, lift: L,
+    yaw, pitch, dist, w, h, lift: L, firstPerson: false,
     focal: focalFor(h),
     target: { x: tx, y: ty + L, z: tz },
   };
 }
 
+/**
+ * First person: the eye is placed exactly, and the "target" is one unit along
+ * forward purely so the same centre-of-screen assertion applies to both modes.
+ * dist is 0, which is why nothing here can put the eye underground.
+ */
+export function makeEyeView(ex, ey, ez, yaw, pitch, w, h) {
+  const cp = Math.cos(pitch);
+  return {
+    eye: { x: ex, y: ey, z: ez },
+    yaw, pitch, dist: 0, lift: 0, firstPerson: true,
+    focal: focalFor(h), w, h,
+    target: { x: ex + Math.sin(yaw) * cp, y: ey - Math.sin(pitch), z: ez + Math.cos(yaw) * cp },
+  };
+}
+
 const _v = [0, 0, 0];
 
-/** Returns false when the point is at or behind the near plane. */
 export function projectPoint(px, py, pz, view, out) {
   toCameraSpace(px, py, pz, view.eye, view.yaw, view.pitch, _v);
   if (_v[2] < NEAR_Z) return false;
@@ -107,13 +138,9 @@ export function projectPoint(px, py, pz, view, out) {
 }
 
 // ---------------------------------------------------------------------------
-// Box geometry. Lives here, not in the shell, so the gate can assert what ends
-// up on screen instead of trusting a renderer nobody can test.
-//
-// Convention, shared with platforms: a box's TOP face sits at y, and it extends
-// DOWN by h. Anything meant to rest on the ground therefore needs y = its own
-// height, not y = 0. Getting that backwards buries the whole object; see
-// docs/PITFALLS.md.
+// Box geometry. A box's TOP face sits at y and it extends DOWN by h, so anything
+// resting on the ground needs y = its own height. Getting that backwards buries
+// the object; it buried every tree, fence and barn once already.
 // ---------------------------------------------------------------------------
 
 export const BOX_CORNERS = [
@@ -126,17 +153,13 @@ export const BOX_FACES = [
   { idx: [1, 0, 4, 5], n: [0, 0, -1], lit: 0.62 },
   { idx: [2, 1, 5, 6], n: [1, 0, 0], lit: 0.90 },
   { idx: [0, 3, 7, 4], n: [-1, 0, 0], lit: 0.70 },
+  // BOTTOM. v2.1 had five faces and no bottom, so looking UP at a platform showed
+  // you straight through it into its interior -- half of the "see inside the model"
+  // report. In a climbing game you are underneath platforms constantly, so a
+  // five-faced box is only watertight from a viewpoint the player never has.
+  { idx: [4, 5, 6, 7], n: [0, -1, 0], lit: 0.46 },
 ];
 
-/**
- * Sutherland-Hodgman clip of a camera-space polygon against z >= NEAR_Z.
- *
- * This exists because the obvious alternative -- "if any corner is behind the
- * camera, skip the box" -- silently deletes exactly the geometry you are standing
- * on. A 26-unit farmyard viewed from 9 units up has its near corners behind the
- * eye, so the entire ground plane vanished and the animal appeared to float in
- * the sky. Small boxes never triggered it, which is why it hid through v1.0.
- */
 export function clipNearZ(poly, near = NEAR_Z) {
   const out = [];
   const n = poly.length;
@@ -163,10 +186,6 @@ export function polygonArea(pts) {
 
 const _corner = [0, 0, 0];
 
-/**
- * Screen polygons for the visible faces of an axis-aligned box, near-plane
- * clipped. Returns [{ lit, pts:[[x,y],...] }, ...]; empty when nothing shows.
- */
 export function boxScreenFaces(x, y, z, w, h, d, view) {
   const hw = w / 2, hd = d / 2;
   const eye = view.eye;
@@ -179,10 +198,9 @@ export function boxScreenFaces(x, y, z, w, h, d, view) {
   const faces = [];
   for (let f = 0; f < BOX_FACES.length; f++) {
     const face = BOX_FACES[f], n = face.n;
-    // Back-face cull in WORLD space: cheaper than a normal transform and exact
-    // for axis-aligned boxes.
     let vis;
     if (n[1] === 1) vis = eye.y > y;
+    else if (n[1] === -1) vis = eye.y < y - h;
     else if (n[0] !== 0) vis = (eye.x - x) * n[0] > hw;
     else vis = (eye.z - z) * n[2] > hd;
     if (!vis) continue;
@@ -198,11 +216,8 @@ export function boxScreenFaces(x, y, z, w, h, d, view) {
   return faces;
 }
 
-/** Sutherland-Hodgman clip of a 2D polygon to the viewport rectangle. */
 export function clipToRect(pts, w, h) {
-  const edges = [
-    (p) => p[0] >= 0, (p) => p[0] <= w, (p) => p[1] >= 0, (p) => p[1] <= h,
-  ];
+  const edges = [(p) => p[0] >= 0, (p) => p[0] <= w, (p) => p[1] >= 0, (p) => p[1] <= h];
   const cross = [
     (a, b) => (0 - a[0]) / (b[0] - a[0]), (a, b) => (w - a[0]) / (b[0] - a[0]),
     (a, b) => (0 - a[1]) / (b[1] - a[1]), (a, b) => (h - a[1]) / (b[1] - a[1]),
@@ -226,11 +241,6 @@ export function clipToRect(pts, w, h) {
   return poly;
 }
 
-/**
- * Fraction of the viewport a box actually paints, 0..1. Clipping to the rect
- * matters: a face clipped to the near plane projects to coordinates thousands of
- * pixels wide, so raw polygon area is meaningless as a measure of what you see.
- */
 export function screenCoverage(faces, w, h) {
   let a = 0;
   for (let i = 0; i < faces.length; i++) {
@@ -242,18 +252,15 @@ export function screenCoverage(faces, w, h) {
 
 // ---------------------------------------------------------------------------
 // Rotated boxes, so a body part can belong to an animal that FACES somewhere.
-// Local axes: +x is the animal's right, +z is its forward, +y is up.
+// +x is the animal's right, +z its forward, +y up.
 // local -> world:  wx = ox + lx*c + lz*s,  wz = oz - lx*s + lz*c
-// world -> local:  lx = dx*c - dz*s,       lz = dx*s + dz*c   (c=cos yaw, s=sin yaw)
 //
 // Checked against the axis-aligned path two ways: at yaw 0 the output is
-// byte-identical, and at 90 degrees a 4x1 box gives the same screen silhouette as
-// an axis-aligned 1x4. Do NOT check it by comparing face `lit` values -- under
-// rotation a local +x face legitimately becomes a world -z face, so the shading
-// SHOULD differ. Same world volume means same silhouette, not same lighting.
+// byte-identical, and at 90 degrees a 4x1 box gives the same screen SILHOUETTE as
+// an axis-aligned 1x4. Do not compare face `lit` values -- under rotation a local
+// +x face legitimately becomes a world -z face, so shading should differ.
 // ---------------------------------------------------------------------------
 
-/** A frame is an origin plus a yaw. Precompute the trig once per animal. */
 export function makeFrame(x, y, z, yaw) {
   return { x, y, z, yaw, c: Math.cos(yaw), s: Math.sin(yaw) };
 }
@@ -268,11 +275,6 @@ export function localToWorld(frame, lx, ly, lz, out) {
 const _lw = [0, 0, 0];
 const _c2 = [0, 0, 0];
 
-/**
- * Screen faces for a box given in FRAME-LOCAL coordinates. Same near-plane clip
- * as boxScreenFaces; back-face culling is done by moving the eye into local
- * space, which keeps the test exact and axis-aligned.
- */
 export function localBoxScreenFaces(lx, ly, lz, w, h, d, frame, view) {
   const eye = view.eye;
   const dx = eye.x - frame.x, dz = eye.z - frame.z;
@@ -294,6 +296,7 @@ export function localBoxScreenFaces(lx, ly, lz, w, h, d, frame, view) {
     const face = BOX_FACES[f], n = face.n;
     let vis;
     if (n[1] === 1) vis = ely > ly;
+    else if (n[1] === -1) vis = ely < ly - h;
     else if (n[0] !== 0) vis = (elx - lx) * n[0] > hw;
     else vis = (elz - lz) * n[2] > hd;
     if (!vis) continue;
@@ -307,4 +310,70 @@ export function localBoxScreenFaces(lx, ly, lz, w, h, d, frame, view) {
     faces.push({ lit: face.lit, pts });
   }
   return faces;
+}
+
+// ---------------------------------------------------------------------------
+// CAMERA COLLISION.
+//
+// The orbit arm is ~12 units long and swings straight through the tree line and
+// the fence. When the eye ends up inside a box you see that box's INNER faces
+// filling the frame -- which is exactly the "I can see through into the model"
+// report. It is a camera problem, not a mesh problem, and no amount of remodelling
+// fixes it. Measured on the default spawn view: tilting up put the eye inside
+// `houseWall` AND a fence `rail` at once.
+//
+// Fix: march out from the target and stop short of the first obstruction, which is
+// what every third-person camera does. Pulling IN keeps the target dead centre (the
+// invariant the whole camera suite rests on) -- shoving the eye sideways would not.
+// ---------------------------------------------------------------------------
+
+export const CAM_PROBE_R = 0.34;   // clearance kept around the eye
+export const CAM_MIN_PULL = 1.6;   // never closer, or you are inside the animal
+
+function pointClearOf(x, y, z, boxes, r) {
+  for (let i = 0; i < boxes.length; i++) {
+    const b = boxes[i];
+    if (b.infinite) continue;
+    if (Math.abs(x - b.x) > b.w / 2 + r) continue;
+    if (Math.abs(z - b.z) > b.d / 2 + r) continue;
+    if (y > b.y + r || y < b.y - b.h - r) continue;
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Largest usable orbit distance <= wantDist whose eye is clear of `boxes`.
+ * Marches outward in fixed steps and returns the last clear sample, so the result
+ * is monotone in wantDist and cannot jitter between frames the way a binary search
+ * over a non-convex union can.
+ */
+export function clearOrbitDist(tx, ty, tz, yaw, pitch, wantDist, boxes, r = CAM_PROBE_R) {
+  // Check the FULL distance first and return it exactly when clear. Marching in 0.3
+  // steps alone left the camera permanently 0.3 short of what you asked for -- a
+  // quantisation artifact that reported as "144 of 144 views needed a pull-in" when
+  // the real answer was that none of them did.
+  const full = cameraEye(tx, ty, tz, yaw, pitch, wantDist);
+  if (pointClearOf(full.x, full.y, full.z, boxes, r)) return wantDist;
+
+  const step = 0.3;
+  let best = Math.min(CAM_MIN_PULL, wantDist);
+  for (let dd = best; dd <= wantDist; dd += step) {
+    const e = cameraEye(tx, ty, tz, yaw, pitch, dd);
+    if (!pointClearOf(e.x, e.y, e.z, boxes, r)) break;
+    best = dd;
+  }
+  return best;
+}
+
+/** Which box the eye is inside, or null. Must be null after a pull-in. */
+export function eyeInsideBox(view, boxes, r = 0) {
+  const e = view.eye;
+  for (let i = 0; i < boxes.length; i++) {
+    const b = boxes[i];
+    if (b.infinite) continue;
+    if (Math.abs(e.x - b.x) <= b.w / 2 + r && Math.abs(e.z - b.z) <= b.d / 2 + r &&
+        e.y <= b.y + r && e.y >= b.y - b.h - r) return b.kind || ('platform' + b.i);
+  }
+  return null;
 }
