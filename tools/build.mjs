@@ -18,7 +18,7 @@ export const MARKER = '/* @INLINE:CORE */';
 
 // Explicit and ordered. reach.mjs is verification-only and must NOT reach the
 // shipped file; the player should never download the test harness.
-export const INLINE_ORDER = ['rng.mjs', 'constants.mjs', 'camera.mjs', 'level.mjs', 'player.mjs'];
+export const INLINE_ORDER = ['rng.mjs', 'constants.mjs', 'camera.mjs', 'animal.mjs', 'level.mjs', 'player.mjs'];
 
 function stripModuleSyntax(src, name) {
   // Multi-line imports exist in level.mjs / player.mjs, hence [\s\S] not .

@@ -16,6 +16,19 @@ export const CAM_PITCH_DEFAULT = 0.30;
 export const MOUSE_SENS_X = 0.0024;    // radians per pixel of pointer movement
 export const MOUSE_SENS_Y = 0.0018;
 
+/**
+ * Which way a pointer delta turns the camera. Derived, and this time actually
+ * checked: the forward vector is (sin yaw cos p, -sin p, cos yaw cos p), so
+ * d/dyaw of its horizontal part is (cos yaw, 0, -sin yaw) -- which projects to
+ * SCREEN RIGHT. Therefore increasing yaw pans right, and mouse-right must ADD.
+ *
+ * v2.0 shipped `camYaw -= dx` and felt inverted. `Q`/`E` were correct, so the two
+ * input paths disagreed with each other, which is the tell. `camera:mouse-yaw-sign`
+ * pins it by projecting a probe point instead of trusting a comment.
+ */
+export const YAW_PER_PIXEL = MOUSE_SENS_X;    // add this * dx to yaw
+export const PITCH_PER_PIXEL = MOUSE_SENS_Y;  // add this * dy to pitch (mouse down = look down)
+
 export const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
 export const clampPitch = (p) => clamp(p, CAM_PITCH_MIN, CAM_PITCH_MAX);
 export const clampDist = (d) => clamp(d, CAM_DIST_MIN, CAM_DIST_MAX);
@@ -65,13 +78,19 @@ export function toCameraSpace(px, py, pz, eye, yaw, pitch, out) {
 
 export const NEAR_Z = 0.12;
 
-/** Builds everything a frame needs, so the shell keeps no camera maths of its own. */
-export function makeView(tx, ty, tz, yaw, pitch, dist, w, h) {
+/**
+ * Builds everything a frame needs, so the shell keeps no camera maths of its own.
+ * `lift` is how far above the feet to aim; it defaults to CAM_TARGET_LIFT but the
+ * shell scales it with the animal's height, because framing a chicken and framing
+ * a cow at the same aim point puts one of them in the wrong half of the screen.
+ */
+export function makeView(tx, ty, tz, yaw, pitch, dist, w, h, lift) {
+  const L = lift === undefined ? CAM_TARGET_LIFT : lift;
   return {
-    eye: cameraEye(tx, ty + CAM_TARGET_LIFT, tz, yaw, pitch, dist),
-    yaw, pitch, dist, w, h,
+    eye: cameraEye(tx, ty + L, tz, yaw, pitch, dist),
+    yaw, pitch, dist, w, h, lift: L,
     focal: focalFor(h),
-    target: { x: tx, y: ty + CAM_TARGET_LIFT, z: tz },
+    target: { x: tx, y: ty + L, z: tz },
   };
 }
 
@@ -219,4 +238,73 @@ export function screenCoverage(faces, w, h) {
     if (c.length >= 3) a += polygonArea(c);
   }
   return a / (w * h);
+}
+
+// ---------------------------------------------------------------------------
+// Rotated boxes, so a body part can belong to an animal that FACES somewhere.
+// Local axes: +x is the animal's right, +z is its forward, +y is up.
+// local -> world:  wx = ox + lx*c + lz*s,  wz = oz - lx*s + lz*c
+// world -> local:  lx = dx*c - dz*s,       lz = dx*s + dz*c   (c=cos yaw, s=sin yaw)
+//
+// Checked against the axis-aligned path two ways: at yaw 0 the output is
+// byte-identical, and at 90 degrees a 4x1 box gives the same screen silhouette as
+// an axis-aligned 1x4. Do NOT check it by comparing face `lit` values -- under
+// rotation a local +x face legitimately becomes a world -z face, so the shading
+// SHOULD differ. Same world volume means same silhouette, not same lighting.
+// ---------------------------------------------------------------------------
+
+/** A frame is an origin plus a yaw. Precompute the trig once per animal. */
+export function makeFrame(x, y, z, yaw) {
+  return { x, y, z, yaw, c: Math.cos(yaw), s: Math.sin(yaw) };
+}
+
+export function localToWorld(frame, lx, ly, lz, out) {
+  out[0] = frame.x + lx * frame.c + lz * frame.s;
+  out[1] = frame.y + ly;
+  out[2] = frame.z - lx * frame.s + lz * frame.c;
+  return out;
+}
+
+const _lw = [0, 0, 0];
+const _c2 = [0, 0, 0];
+
+/**
+ * Screen faces for a box given in FRAME-LOCAL coordinates. Same near-plane clip
+ * as boxScreenFaces; back-face culling is done by moving the eye into local
+ * space, which keeps the test exact and axis-aligned.
+ */
+export function localBoxScreenFaces(lx, ly, lz, w, h, d, frame, view) {
+  const eye = view.eye;
+  const dx = eye.x - frame.x, dz = eye.z - frame.z;
+  const elx = dx * frame.c - dz * frame.s;
+  const ely = eye.y - frame.y;
+  const elz = dx * frame.s + dz * frame.c;
+  const hw = w / 2, hd = d / 2;
+
+  const cam = [];
+  for (let i = 0; i < 8; i++) {
+    const cn = BOX_CORNERS[i];
+    localToWorld(frame, lx + cn[0] * hw, ly + cn[1] * h, lz + cn[2] * hd, _lw);
+    toCameraSpace(_lw[0], _lw[1], _lw[2], eye, view.yaw, view.pitch, _c2);
+    cam.push([_c2[0], _c2[1], _c2[2]]);
+  }
+
+  const faces = [];
+  for (let f = 0; f < BOX_FACES.length; f++) {
+    const face = BOX_FACES[f], n = face.n;
+    let vis;
+    if (n[1] === 1) vis = ely > ly;
+    else if (n[0] !== 0) vis = (elx - lx) * n[0] > hw;
+    else vis = (elz - lz) * n[2] > hd;
+    if (!vis) continue;
+    const clipped = clipNearZ([cam[face.idx[0]], cam[face.idx[1]], cam[face.idx[2]], cam[face.idx[3]]]);
+    if (clipped.length < 3) continue;
+    const pts = [];
+    for (let k = 0; k < clipped.length; k++) {
+      const v = clipped[k];
+      pts.push([view.w / 2 + (v[0] * view.focal) / v[2], view.h / 2 - (v[1] * view.focal) / v[2]]);
+    }
+    faces.push({ lit: face.lit, pts });
+  }
+  return faces;
 }
