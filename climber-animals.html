@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Climber Animals: Together — v2.1</title>
+<title>Climber Animals: Together — v3.0</title>
 <style>
   html,body{margin:0;height:100%;overflow:hidden;background:#0d1b2a;
     font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif;color:#fff;
@@ -24,7 +24,7 @@
   .sp{display:inline-block;padding:5px 11px;margin:2px;border-radius:9px;font-size:13px;
     background:rgba(255,255,255,.1);border:1px solid transparent;cursor:pointer}
   .sp.on{background:rgba(255,255,255,.92);color:#16232f;font-weight:700;border-color:#fff}
-  #keys{bottom:16px;left:16px;font-size:12.5px;line-height:1.75;opacity:.9;max-width:290px}
+  #keys{bottom:16px;left:16px;font-size:12.5px;line-height:1.75;opacity:.9;max-width:300px}
   #keys b{display:inline-block;min-width:62px;font-family:Consolas,monospace;
     background:rgba(255,255,255,.14);border-radius:5px;padding:0 6px;margin-right:8px;font-weight:600}
   #banner{left:50%;top:34%;transform:translate(-50%,-50%);text-align:center;display:none;padding:24px 40px}
@@ -34,16 +34,20 @@
   #lock{left:50%;top:50%;transform:translate(-50%,-50%);text-align:center;
     padding:16px 26px;cursor:pointer;transition:opacity .25s}
   #lock.hidden{opacity:0;pointer-events:none}
+  #reticle{left:50%;top:50%;width:5px;height:5px;margin:-2.5px 0 0 -2.5px;position:fixed;
+    border-radius:50%;background:rgba(255,255,255,.85);box-shadow:0 0 4px rgba(0,0,0,.6);display:none}
 </style>
 </head>
 <body>
 <canvas id="view"></canvas>
+<div id="reticle"></div>
 
 <div id="hud" class="panel">
   <div class="big"><span id="h-cur">0.0</span><span>m</span></div>
   <div class="row"><span>最高</span><span><b id="h-best">0.0</b> m</span></div>
   <div class="row"><span>掉落</span><span><b id="h-falls">0</b> 次</span></div>
   <div class="row"><span>塔顶</span><span><b id="h-top">0</b> m</span></div>
+  <div class="row"><span>视角</span><span><b id="h-view">第三人称</b></span></div>
   <div id="bar"><div id="barfill"></div></div>
 </div>
 
@@ -56,10 +60,11 @@
   <div><b>W A S D</b>移动（跟着镜头方向）</div>
   <div><b>Space</b>跳（只有落地时能跳）</div>
   <div><b>移动鼠标</b>转视角（点一下画面先锁定）</div>
+  <div><b>V</b>切换第一 / 第三人称</div>
   <div><b>Q E</b>左右转 &nbsp;<b>滚轮</b>拉远拉近</div>
   <div><b>1 2 3 4</b>换动物（牛/鸡/羊/猪）</div>
   <div><b>R</b>回农场重来（最高记录保留）</div>
-  <div style="opacity:.62;margin-top:6px">没有存档点。掉下去就得重爬。<br>草地无限延伸，可以随便走远。</div>
+  <div style="opacity:.62;margin-top:6px">想抬头看天空？按 <b style="min-width:0">V</b> 进第一人称。<br>第三人称的镜头会撞到地面，抬不高。</div>
 </div>
 
 <div id="lock" class="panel">
@@ -78,7 +83,8 @@
 /* ============================================================================
  * PURE CORE - inlined verbatim from src/core/ by tools/build.mjs.
  * DO NOT EDIT BELOW THIS LINE. Edit src/core/*.mjs and run `node tools/build.mjs`.
- * The fast gate rebuilds and byte-compares, so an edit here turns CI red.
+ * CI regenerates this file, and the fast gate byte-compares it, so an edit here
+ * turns the build red.
  * ==========================================================================*/
 // ---- src/core/rng.mjs ----
 // Seeded PRNG. Pure: same seed -> same sequence, forever.
@@ -1234,7 +1240,7 @@ function insideAnyPlatform(s, level, playerR = PLAYER_R) {
  * END PURE CORE. Everything below is shell: rendering, input, HUD. No physics.
  * ==========================================================================*/
 
-var BUILD_VERSION = "2.1.0";
+var BUILD_VERSION = "3.0.0";
 
 // ---------------------------------------------------------------- state
 var level = makeLevel(DEFAULT_SEED);
@@ -1242,18 +1248,20 @@ var player = makePlayer(level, "cow");
 var speciesId = "cow";
 var camYaw = 0.6, camPitch = CAM_PITCH_DEFAULT, camDist = CAM_DIST_DEFAULT;
 var pointerLocked = false;
-// Visual-only animal state. Facing is smoothed toward the direction of travel so
-// the animal turns instead of snapping, and it is NOT physics: the collision box
-// is a circle of PLAYER_R whatever way the model points.
+var firstPerson = false;
+// Visual-only animal state. Facing is smoothed toward the direction of travel; it
+// is NOT physics, the collision body is a square of PLAYER_R whichever way it points.
 var facing = 0.6, squash = 0, prevOnGround = true, prevVy = 0;
 var keys = Object.create(null);
 var consoleErrors = [];
 var acc = 0, last = 0, tickCount = 0, fps = 0, fpsAcc = 0, fpsN = 0;
+// Everything the camera must not end up inside. Built once: the level is static.
+var solidForCamera = level.decor.concat(level.platforms);
 
 var cv = document.getElementById("view");
 var ctx = cv.getContext("2d");
 var W = 0, H = 0, DPR = 1;
-var view = null;   // built once per frame by the pure core
+var view = null;
 
 function resize() {
   DPR = Math.min(window.devicePixelRatio || 1, 2);
@@ -1268,25 +1276,42 @@ function resize() {
 window.addEventListener("resize", resize);
 resize();
 
-// The shell owns NO camera maths. makeView / projectPoint live in the pure core
-// so the fast gate can assert where things land on screen; v1.0 kept them here,
-// where nothing could test them, and shipped inverted pitch signs that threw the
-// animal 83px below the bottom edge. See docs/PITFALLS.md.
-// Framing scales with the animal, so a chicken is not a speck and a cow does not
-// fill the frame. camDist is still yours to change with the wheel; this only moves
-// the DEFAULT and the aim height.
-function animalHeight() {
-  return animalParts(speciesDef(speciesId), makePose(0, 0, 0, 0)).height;
+// The shell owns NO camera maths: makeView / makeEyeView / projectPoint /
+// clearOrbitDist all live in the pure core so the gate can assert where things land
+// on screen. v1.0 kept them here, where nothing could test them, and shipped
+// inverted pitch signs that threw the animal 83px below the bottom edge.
+function animalModel() {
+  return animalParts(speciesDef(speciesId), makePose(0, 0, 0, 0));
+}
+function thirdPersonWantDist(h) {
+  // Apparent size roughly constant across species, but not strictly proportional:
+  // fully proportional put the chicken camera at 6.6 units, close enough to clip
+  // scenery, and it erases the fact that a cow IS bigger.
+  return camDist * (0.30 + 0.68 * h);
 }
 function updateCamera() {
-  // Apparent size should be roughly constant across species, so distance tracks
-  // the model height. Not strictly proportional: fully proportional put the
-  // chicken camera at 6.6 units, close enough to clip through scenery, and it also
-  // erases the fact that a cow IS bigger. 0.30 + 0.68*h keeps a cow at ~11 and a
-  // chicken at ~7 while both still fill a similar slice of the frame.
-  var h = animalHeight();
-  view = makeView(player.x, player.y, player.z, camYaw, camPitch,
-    camDist * (0.30 + 0.68 * h), W, H, h * 0.70);
+  var m = animalModel();
+  if (firstPerson) {
+    var e = firstPersonEye(speciesDef(speciesId), currentPose());
+    var w1 = [0, 0, 0];
+    localToWorld(makeFrame(player.x, player.y, player.z, facing), e.x, e.y, e.z, w1);
+    view = makeEyeView(w1[0], w1[1], w1[2], camYaw, camPitch, W, H);
+    return;
+  }
+  var lift = m.height * 0.70;
+  var want = thirdPersonWantDist(m.height);
+  // Pull the orbit IN until the eye is clear of scenery. Pulling in keeps the
+  // animal dead centre; shoving the eye sideways would silently decentre it.
+  var dd = clearOrbitDist(player.x, player.y + lift, player.z, camYaw, camPitch, want, solidForCamera);
+  view = makeView(player.x, player.y, player.z, camYaw, camPitch, dd, W, H, lift);
+}
+// The pitch floor depends on the CURRENT distance, so it is recomputed wherever
+// pitch changes rather than stored. On flat ground it is about -3 degrees.
+function pitchLimits() {
+  if (firstPerson) return [FP_PITCH_MIN, FP_PITCH_MAX];
+  var m = animalModel();
+  var lift = m.height * 0.70;
+  return [pitchFloorFor(player.y + lift, thirdPersonWantDist(m.height), 0), CAM_PITCH_MAX];
 }
 function toCam(px, py, pz, out) {
   return toCameraSpace(px, py, pz, view.eye, view.yaw, view.pitch, out);
@@ -1303,19 +1328,12 @@ function shade(hex, f) {
   var b = Math.min(255, Math.round((n & 255) * f));
   return "rgb(" + r + "," + g + "," + b + ")";
 }
-// Blend toward the horizon colour so distance reads. t = 0 is untouched.
 function hazed(hex, f, t) {
   var n = parseInt(hex.slice(1), 16);
   var mix = function (c) { return Math.min(255, Math.round(c * f * (1 - t) + 196 * t)); };
   return "rgb(" + mix((n >> 16) & 255) + "," + mix((n >> 8) & 255) + "," + mix(n & 255) + ")";
 }
-
-// ---------------------------------------------------------------- box drawing
-// All geometry (corners, back-face culling, near-plane clipping, projection) is
-// in the pure core so the gate can assert what reaches the screen. The shell only
-// picks colours and fills paths.
-function drawBox(x, y, z, w, h, d, color, alpha, haze) {
-  var faces = boxScreenFaces(x, y, z, w, h, d, view);
+function fillFaces(faces, color, alpha, haze) {
   if (faces.length === 0) return;
   ctx.globalAlpha = alpha === undefined ? 1 : alpha;
   for (var f = 0; f < faces.length; f++) {
@@ -1329,6 +1347,9 @@ function drawBox(x, y, z, w, h, d, color, alpha, haze) {
   }
   ctx.globalAlpha = 1;
 }
+function drawBox(x, y, z, w, h, d, color, alpha, haze) {
+  fillFaces(boxScreenFaces(x, y, z, w, h, d, view), color, alpha, haze);
+}
 
 // ---------------------------------------------------------------- sky
 function drawSky() {
@@ -1339,9 +1360,8 @@ function drawSky() {
   g.addColorStop(1, mixHex("#e8f2d8", "#b98fb0", t));
   ctx.fillStyle = g;
   ctx.fillRect(0, 0, W, H);
-  // sun, parallaxed by yaw so turning the camera reads as turning
   var sx = (W * 0.5) + Math.sin(view.yaw - 2.1) * W * 0.62;
-  var sy = H * (0.20 + t * 0.1);
+  var sy = H * (0.20 + t * 0.1) + horizonY(view.pitch, H) - H / 2;
   var sg = ctx.createRadialGradient(sx, sy, 6, sx, sy, 120);
   sg.addColorStop(0, "rgba(255,247,214,.95)");
   sg.addColorStop(1, "rgba(255,247,214,0)");
@@ -1359,50 +1379,39 @@ function mixHex(a, b, t) {
 // ---------------------------------------------------------------- animal
 function speciesDef(id) { return speciesById(id); }
 
-// Walk cycle phase comes from DISTANCE WALKED, not elapsed time, so the legs
-// never skate when you change speed or stop mid-stride. player.dist is core state,
-// which is also why a replay animates identically.
+// Walk phase comes from DISTANCE WALKED, not elapsed time, so the legs never skate
+// when speed changes. player.dist is core state, which is also why a replay animates
+// identically.
 var STRIDE = 1.35;
 function currentPose() {
   var speed = Math.hypot(player.vx, player.vz);
-  var speed01 = Math.min(1, speed / MOVE_SPEED);
-  var gait = (player.dist / STRIDE) % 1;
-  return makePose(gait, speed01, player.onGround ? 0 : 1, squash);
+  return makePose((player.dist / STRIDE) % 1, Math.min(1, speed / MOVE_SPEED),
+    player.onGround ? 0 : 1, squash);
 }
 
-function drawAnimal() {
-  var sp = speciesDef(speciesId);
-  var model = animalParts(sp, currentPose());
-  var frame = makeFrame(player.x, player.y, player.z, facing);
-  var parts = model.parts;
-
-  // Sort the parts back to front in camera space. Without this, a snout drawn
-  // before the head it sits on top of disappears into it from some angles.
-  var ordered = [];
-  var probe = [0, 0, 0];
-  for (var i = 0; i < parts.length; i++) {
-    var pt = parts[i];
-    localToWorld(frame, pt.x, pt.y - pt.h / 2, pt.z, probe);
-    toCam(probe[0], probe[1], probe[2], _s);
-    ordered.push([_s[2], pt]);
+// Squash from LANDING IMPACT (the vy on the frame before touchdown), so a small hop
+// gives a small squish and a long fall a real thud.
+function updateAnimalVisuals(dt) {
+  var speed = Math.hypot(player.vx, player.vz);
+  if (firstPerson) {
+    // In first person the body IS the camera, so face where you look or strafing
+    // spins the world.
+    facing = camYaw;
+  } else if (speed > 0.35) {
+    var want = Math.atan2(player.vx, player.vz);
+    var d = want - facing;
+    while (d > Math.PI) d -= 6.2831853;
+    while (d < -Math.PI) d += 6.2831853;
+    facing += d * Math.min(1, dt * 11);
   }
-  ordered.sort(function (a, b) { return b[0] - a[0]; });
+  if (player.onGround && !prevOnGround) squash = Math.min(1, Math.abs(prevVy) / 18);
+  else if (!player.onGround) squash = -Math.min(0.5, Math.max(0, player.vy) / 26);
+  squash += (0 - squash) * Math.min(1, dt * 9);
+  prevOnGround = player.onGround;
+  prevVy = player.vy;
+}
 
-  for (var j = 0; j < ordered.length; j++) {
-    var q = ordered[j][1];
-    var faces = localBoxScreenFaces(q.x, q.y, q.z, q.w, q.h, q.d, frame, view);
-    for (var f = 0; f < faces.length; f++) {
-      var pts = faces[f].pts;
-      ctx.fillStyle = shade(q.color, faces[f].lit);
-      ctx.beginPath();
-      ctx.moveTo(pts[0][0], pts[0][1]);
-      for (var k = 1; k < pts.length; k++) ctx.lineTo(pts[k][0], pts[k][1]);
-      ctx.closePath();
-      ctx.fill();
-    }
-  }
-
-  // eyes last, in local space so they ride the head when the animal turns
+function drawEyes(model, frame) {
   var e = [0, 0, 0], w2 = [0, 0, 0];
   for (var side = -1; side <= 1; side += 2) {
     localToWorld(frame, side * model.eye.x, model.eye.y, model.eye.z, w2);
@@ -1415,30 +1424,8 @@ function drawAnimal() {
   }
 }
 
-// Facing, squash and stretch. Squash is driven by the LANDING IMPACT (the vy we
-// had on the frame before touching down), so a small hop gives a small squish and
-// a long fall gives a real thud.
-function updateAnimalVisuals(dt) {
-  var speed = Math.hypot(player.vx, player.vz);
-  if (speed > 0.35) {
-    var want = Math.atan2(player.vx, player.vz);
-    var d = want - facing;
-    while (d > Math.PI) d -= 6.2831853;
-    while (d < -Math.PI) d += 6.2831853;
-    facing += d * Math.min(1, dt * 11);
-  }
-  if (player.onGround && !prevOnGround) {
-    squash = Math.min(1, Math.abs(prevVy) / 18);
-  } else if (!player.onGround) {
-    squash = -Math.min(0.5, Math.max(0, player.vy) / 26);   // stretch on the way up
-  }
-  squash += (0 - squash) * Math.min(1, dt * 9);
-  prevOnGround = player.onGround;
-  prevVy = player.vy;
-}
-
-// Landing shadow: the highest platform top strictly below the player. Purely
-// cosmetic, but it is what makes an air jump judgeable at all.
+// Landing shadow: the highest platform top strictly below the player. Cosmetic, but
+// it is what makes an air jump judgeable at all.
 function drawShadow() {
   var bestP = null;
   for (var i = 0; i < level.platforms.length; i++) {
@@ -1448,7 +1435,7 @@ function drawShadow() {
     if (!bestP || p.y > bestP.y) bestP = p;
   }
   if (!bestP) return;
-  var c = [0,0,0];
+  var c = [0, 0, 0];
   if (!project(player.x, bestP.y + 0.02, player.z, c)) return;
   var drop = player.y - bestP.y;
   var rad = Math.max(3, (view.focal / c[2]) * 0.36);
@@ -1459,46 +1446,48 @@ function drawShadow() {
 }
 
 // ---------------------------------------------------------------- frame
-var order = [];
-// The shell's own scratch vector. Do NOT reuse the core's `_v`: that only happens
-// to be reachable because the build inlines the core into this file, and it is the
-// same buffer projectPoint writes into. Borrowing it would work today and break
-// silently the moment anything projects between the write and the read.
+// The shell's own scratch vector. Do NOT borrow the core's: it only happens to be
+// reachable because the build inlines everything into one file, and it is the same
+// buffer the projection writes into.
 var _s = [0, 0, 0];
+var order = [];
+
+// ONE painter's list for the WHOLE frame, animal parts included. v2.1 drew the
+// animal after everything, so it painted over any box nearer than it: the cow looked
+// like it was standing on a crate while the HUD read 0.0m.
+function push(depth, kind, a, b, c, d, e, f, g, h, i) {
+  order.push([depth, kind, a, b, c, d, e, f, g, h, i]);
+}
 function collect(list, isDecor) {
   for (var i = 0; i < list.length; i++) {
     var p = list[i];
-    if (p.infinite) continue;      // drawGround() owns the ground plane
+    if (p.infinite) continue;   // the ground plane is drawn by drawGround()
     if (Math.abs(p.y - player.y) > 62) continue;
     toCam(p.x, p.y, p.z, _s);
-    if (_s[2] < 0.4 || _s[2] > 120) continue;
-    order.push([_s[2], p, isDecor]);
+    if (_s[2] < 0.4 || _s[2] > 130) continue;
+    push(_s[2], "w", p.x, p.y, p.z, p.w, p.h, p.d, p.color,
+      p.kind === "cloud" ? 0.9 : 1, Math.min(0.55, Math.max(0, (_s[2] - 34) / 90)));
+    if (!isDecor && p.label) push(_s[2] - 1e-4, "label", p);
   }
 }
-// The ground is an infinite plane in the physics, so it has to LOOK infinite too.
-// A slab centred on the player does that, and a checker of slightly darker tiles
-// SNAPPED TO THE WORLD GRID is what makes movement readable -- a plain slab that
-// follows you looks like standing still. Snapping matters: tile the grid to the
-// player instead and the pattern swims, which reads as motion sickness.
+
+// The ground is infinite in the physics, so it must LOOK infinite: one big slab
+// centred on the player plus a world-snapped checker for motion. The checker is
+// snapped to the WORLD, not the player -- tile it to the player and the pattern
+// swims with you, which reads as motion sickness rather than movement.
+//
+// v2.1 used four concentric 0.8-tall rings for a haze gradient. At eye height their
+// SIDE faces filled the frame as giant beige walls. Thin boxes do not have that
+// problem, and the haze now comes from the checker fade instead.
 var GROUND_TILE = 9;
-var GROUND_SPAN = 7;          // tiles each way from the player
-// Concentric slabs, largest first, each hazier than the last. One giant slab gets
-// ONE flat colour, so at 36m up the frame was a single sheet of green with no
-// perspective cue at all -- it read as a void, and the tower looked like it was
-// lying on the grass. Rings give the horizon a gradient without per-vertex shading,
-// which flat-filled polygons cannot do.
-var GROUND_RINGS = [[1600, 0.62], [700, 0.46], [300, 0.30], [120, 0.15]];
+var GROUND_SPAN = 8;
 function drawGround() {
   var g = level.platforms[0];
   var cx = Math.round(player.x / GROUND_TILE) * GROUND_TILE;
   var cz = Math.round(player.z / GROUND_TILE) * GROUND_TILE;
-  for (var r = 0; r < GROUND_RINGS.length; r++) {
-    drawBox(cx, g.y, cz, GROUND_RINGS[r][0], g.h, GROUND_RINGS[r][0], g.color, 1, GROUND_RINGS[r][1]);
-  }
-  // The checker is the motion and altitude cue, so it must never vanish entirely:
-  // fading it to nothing was what left the high-altitude frame featureless. Instead
-  // the tiles GROW with height (9 units near the ground, up to ~34 high up) so the
-  // grid stays legible at any distance while the lines still converge.
+  drawBox(cx, g.y, cz, 1600, 0.05, 1600, g.color, 1, 0.30);
+  // Tiles GROW with altitude so the grid stays legible from up the tower while its
+  // lines still converge. Fading it out instead left the high frame featureless.
   var alt = Math.max(0, player.y);
   var tile = GROUND_TILE * (1 + Math.min(2.8, alt / 26));
   var fade = 1 - Math.min(0.6, alt / 120);
@@ -1507,78 +1496,90 @@ function drawGround() {
   for (var i = -GROUND_SPAN; i <= GROUND_SPAN; i++) {
     for (var j = -GROUND_SPAN; j <= GROUND_SPAN; j++) {
       var tx = cx + i * tile, tz = cz + j * tile;
-      var gi = Math.round(tx / tile), gj = Math.round(tz / tile);
-      if (((gi + gj) & 1) === 0) continue;                       // half the cells
+      if (((Math.round(tx / tile) + Math.round(tz / tile)) & 1) === 0) continue;
       var dd = Math.hypot(tx - player.x, tz - player.z);
       if (dd > tile * (GROUND_SPAN + 0.5)) continue;
-      drawBox(tx, g.y + 0.012, tz, tile, 0.012, tile, "#82bd5a",
-        fade, Math.min(0.5, dd / (tile * 13)));
+      drawBox(tx, g.y + 0.02, tz, tile, 0.02, tile, "#82bd5a", fade, Math.min(0.5, dd / (tile * 13)));
     }
   }
 }
 
-// Clouds drift with player.t, which is CORE state, so the sky animates and stays
-// deterministic. Date.now() here would have broken every replay assertion.
-function drawClouds() {
+// Clouds and smoke both animate from player.t, which is CORE state, so the sky moves
+// and every replay assertion still holds. Date.now() would have broken them.
+function collectClouds() {
   for (var i = 0; i < level.clouds.length; i++) {
     var c = level.clouds[i];
     var x = cloudX(c, player.t) + Math.round(player.x / CLOUD_WRAP) * CLOUD_WRAP;
-    if (Math.abs(c.y - player.y) > 150) continue;
-    var dz = c.z - player.z, dx = x - player.x;
-    if (Math.hypot(dx, dz) > 260) continue;
-    drawBox(x, c.y, c.z, c.w, c.h, c.d, "#ffffff", 0.82, 0.16);
+    if (Math.abs(c.y - player.y) > 160) continue;
+    if (Math.hypot(x - player.x, c.z - player.z) > 280) continue;
+    toCam(x, c.y, c.z, _s);
+    if (_s[2] < 0.4) continue;
+    push(_s[2], "w", x, c.y, c.z, c.w, c.h, c.d, "#ffffff", 0.82, 0.16);
     for (var k = 0; k < c.puffs; k++) {
       var f = (k + 1) / (c.puffs + 1);
-      drawBox(x + (f - 0.5) * c.w * 0.9, c.y + c.h * 0.62, c.z + (k % 2 ? 0.3 : -0.3) * c.d,
-        c.w * 0.42, c.h * 0.8, c.d * 0.62, "#ffffff", 0.72, 0.16);
+      push(_s[2] - 0.01, "w", x + (f - 0.5) * c.w * 0.9, c.y + c.h * 0.62,
+        c.z + (k % 2 ? 0.3 : -0.3) * c.d, c.w * 0.42, c.h * 0.8, c.d * 0.62, "#ffffff", 0.72, 0.16);
     }
   }
 }
-
-// Chimney smoke: puffs on a loop, each rising and swelling and fading. Anchored to
-// the chimney box the level generator placed, so the two cannot drift apart.
-var SMOKE_PUFFS = 7;
-var SMOKE_PERIOD = 3.4;
-function drawSmoke() {
+var SMOKE_PUFFS = 7, SMOKE_PERIOD = 3.4;
+function collectSmoke() {
   var ch = level.chimney;
   if (!ch) return;
   if (Math.hypot(ch.x - player.x, ch.z - player.z) > 90 || player.y > 60) return;
   for (var i = 0; i < SMOKE_PUFFS; i++) {
     var age = ((player.t / SMOKE_PERIOD) + i / SMOKE_PUFFS) % 1;
-    var rise = age * 7.5;
     var size = 0.5 + age * 1.9;
     var fade = 0.5 * (1 - age) * (1 - age);
     if (fade < 0.02) continue;
-    drawBox(ch.x + Math.sin(age * 5 + i) * age * 1.4, ch.top + rise,
-      ch.z + Math.cos(age * 4 + i) * age * 1.1,
-      size, size * 0.75, size, "#e8e4dd", fade, 0.1);
+    var sx = ch.x + Math.sin(age * 5 + i) * age * 1.4;
+    var sy = ch.top + age * 7.5;
+    var sz = ch.z + Math.cos(age * 4 + i) * age * 1.1;
+    toCam(sx, sy, sz, _s);
+    if (_s[2] < 0.4) continue;
+    push(_s[2], "w", sx, sy, sz, size, size * 0.75, size, "#e8e4dd", fade, 0.1);
   }
+}
+
+function collectAnimal() {
+  if (firstPerson) return;   // you are inside its head
+  var model = animalParts(speciesDef(speciesId), currentPose());
+  var frame = makeFrame(player.x, player.y, player.z, facing);
+  var probe = [0, 0, 0];
+  for (var i = 0; i < model.parts.length; i++) {
+    var pt = model.parts[i];
+    localToWorld(frame, pt.x, pt.y - pt.h / 2, pt.z, probe);
+    toCam(probe[0], probe[1], probe[2], _s);
+    push(_s[2], "a", pt, frame);
+  }
+  push(-1e9, "eyes", model, frame);   // eyes last: they are decals on the head
 }
 
 function render() {
   drawSky();
-  drawClouds();
   drawGround();
-  drawSmoke();
   order.length = 0;
+  collectClouds();
+  collectSmoke();
   collect(level.decor, true);
   collect(level.platforms, false);
-  order.sort(function (a, b) { return b[0] - a[0]; });   // painter: far to near
+  collectAnimal();
+  order.sort(function (a, b) { return b[0] - a[0]; });   // far to near
   for (var j = 0; j < order.length; j++) {
-    var q = order[j][1], dec = order[j][2], z = order[j][0];
-    // Aerial haze on far geometry. Cheap, and it is what lets you read which of
-    // two overlapping platforms is nearer.
-    var haze = Math.min(0.55, Math.max(0, (z - 34) / 90));
-    drawBox(q.x, q.y, q.z, q.w, q.h, q.d, q.color, q.kind === "cloud" ? 0.9 : 1, haze);
-    if (!dec && q.label) drawLabel(q);
+    var it = order[j];
+    if (it[1] === "w") drawBox(it[2], it[3], it[4], it[5], it[6], it[7], it[8], it[9], it[10]);
+    else if (it[1] === "a") {
+      var q = it[2];
+      fillFaces(localBoxScreenFaces(q.x, q.y, q.z, q.w, q.h, q.d, it[3], view), q.color, 1, 0);
+    } else if (it[1] === "label") drawLabel(it[2]);
+    else if (it[1] === "eyes") drawEyes(it[2], it[3]);
   }
   drawNextMarker();
-  drawShadow();
-  drawAnimal();
+  if (!firstPerson) drawShadow();
 }
 
-// A soft beacon over the platform you are meant to reach next. Without it the
-// spiral hides the route behind you and the game reads as unfair rather than hard.
+// A soft beacon over the platform you are meant to reach next. Without it the spiral
+// hides the route behind you and the game reads as unfair rather than hard.
 function drawNextMarker() {
   var n = level.platforms[Math.min(player.groundIdx + 1, level.platforms.length - 1)];
   if (!n || n.i === player.groundIdx) return;
@@ -1598,7 +1599,7 @@ function drawNextMarker() {
 }
 
 function drawLabel(p) {
-  var c = [0,0,0];
+  var c = [0, 0, 0];
   if (!project(p.x, p.y + 0.75, p.z, c)) return;
   if (c[2] > 46) return;
   ctx.globalAlpha = Math.max(0, 1 - c[2] / 46);
@@ -1624,8 +1625,9 @@ var MAP = { KeyW:"w", KeyA:"a", KeyS:"s", KeyD:"d", ArrowUp:"w", ArrowLeft:"a",
 window.addEventListener("keydown", function (e) {
   if (MAP[e.code]) { keys[MAP[e.code]] = true; e.preventDefault(); }
   if (e.code === "KeyR") resetRun();
+  if (e.code === "KeyV") setFirstPerson(!firstPerson);
   // Map by the species' OWN declared key, not by roster index: the roster was
-  // reordered for the model file and index-based keys silently remapped 2 and 3.
+  // reordered when the models moved, and index keys silently swapped 2 and 3.
   var want = { Digit1: "1", Digit2: "2", Digit3: "3", Digit4: "4" }[e.code];
   if (want) {
     for (var si = 0; si < SPECIES.length; si++) {
@@ -1634,23 +1636,32 @@ window.addEventListener("keydown", function (e) {
   }
 });
 window.addEventListener("keyup", function (e) { if (MAP[e.code]) keys[MAP[e.code]] = false; });
+
 // --- mouse look ---------------------------------------------------------------
-// Pointer Lock, because that is the only way a browser gives you continuous mouse
-// look: without it a page only sees the cursor while a button is held, which is
-// why v1.0 needed drag-to-turn. The lock request MUST come from a real user
-// gesture, so a click on the canvas arms it. Drag still works as a fallback for
-// anyone who does not want their cursor captured.
+// Pointer Lock is the only way a browser gives continuous mouse look: without it a
+// page only sees the cursor while a button is held, which is why v1.0 needed
+// drag-to-turn. The lock request must come from a real gesture, so a canvas click
+// arms it. Drag still works for anyone who does not want their cursor captured.
 var elLock = document.getElementById("lock");
+var elReticle = document.getElementById("reticle");
 var dragging = false, lastMX = 0, lastMY = 0;
 
-// Mouse right must pan the view RIGHT. v2.0 subtracted here and felt inverted,
-// while Q/E (which subtract for LEFT) were correct -- the two paths disagreeing is
-// the tell. Increasing yaw swings the view toward its own right vector; the
-// derivation is in camera.mjs and `camera:mouse-yaw-sign` checks it by projecting a
-// probe point rather than trusting either comment.
+// Mouse right must pan the view RIGHT. v2.0 subtracted and felt inverted, while Q/E
+// were correct -- the two paths disagreeing is the tell. Increasing yaw swings the
+// view toward its own right vector; the derivation is in camera.mjs.
 function look(dxp, dyp) {
   camYaw += dxp * YAW_PER_PIXEL;
-  camPitch = clampPitch(camPitch + dyp * PITCH_PER_PIXEL);
+  var lim = pitchLimits();
+  camPitch = clampPitch(camPitch + dyp * PITCH_PER_PIXEL, lim[0], lim[1]);
+}
+function setFirstPerson(on) {
+  firstPerson = !!on;
+  elReticle.style.display = firstPerson ? "block" : "none";
+  document.getElementById("h-view").textContent = firstPerson ? "\u7b2c\u4e00\u4eba\u79f0" : "\u7b2c\u4e09\u4eba\u79f0";
+  var lim = pitchLimits();
+  camPitch = clampPitch(camPitch, lim[0], lim[1]);
+  if (firstPerson) facing = camYaw;
+  toast(firstPerson ? "\u7b2c\u4e00\u4eba\u79f0\uff1a\u73b0\u5728\u53ef\u4ee5\u62ac\u5934\u770b\u5929\u7a7a" : "\u7b2c\u4e09\u4eba\u79f0");
 }
 function requestLock() {
   if (pointerLocked) return;
@@ -1669,7 +1680,6 @@ document.addEventListener("pointerlockerror", function () {
 });
 cv.addEventListener("click", requestLock);
 elLock.addEventListener("click", requestLock);
-
 cv.addEventListener("mousedown", function (e) {
   if (!pointerLocked) { dragging = true; lastMX = e.clientX; lastMY = e.clientY; }
 });
@@ -1690,13 +1700,13 @@ function resetRun() {
   var best = player.bestY, falls = player.falls;
   player = makePlayer(level, speciesId);
   player.bestY = best; player.falls = falls;
-  toast("回到农场了，最高记录留着");
+  toast("\u56de\u5230\u519c\u573a\u4e86\uff0c\u6700\u9ad8\u8bb0\u5f55\u7559\u7740");
 }
 function setSpecies(id) {
   speciesId = id;
   player = Object.assign({}, player, { speciesId: id });
   paintPicker();
-  toast("换成 " + speciesDef(id).name);
+  toast("\u6362\u6210 " + speciesDef(id).name);
 }
 
 // ---------------------------------------------------------------- HUD
@@ -1706,7 +1716,7 @@ var elFill = document.getElementById("barfill"), elBanner = document.getElementB
 var elBanSub = document.getElementById("bansub"), elToast = document.getElementById("toast");
 elTop.textContent = level.topY.toFixed(0);
 var toastT = 0;
-function toast(msg) { elToast.textContent = msg; elToast.style.opacity = "1"; toastT = 1.9; }
+function toast(msg) { elToast.textContent = msg; elToast.style.opacity = "1"; toastT = 2.1; }
 function paintPicker() {
   var h = "";
   for (var i = 0; i < SPECIES.length; i++) {
@@ -1727,15 +1737,15 @@ function paintHUD() {
   elFill.style.width = Math.max(0, Math.min(100, (player.bestY / level.topY) * 100)).toFixed(1) + "%";
   if (player.won && elBanner.style.display !== "block") {
     elBanner.style.display = "block";
-    elBanSub.textContent = "用了 " + player.t.toFixed(0) + " 秒，掉了 " + player.falls + " 次";
+    elBanSub.textContent = "\u7528\u4e86 " + player.t.toFixed(0) + " \u79d2\uff0c\u6389\u4e86 " + player.falls + " \u6b21";
   }
 }
 
-// Tell the player what a mistake cost. The metres come from player.lastDrop, which
-// the CORE sets on the landing step -- the shell used to recompute it from its own
-// takeoff bookkeeping, which is a second source of truth for the same fact.
+// The metres come from player.lastDrop, which the CORE sets on the landing step. The
+// shell used to recompute it from its own takeoff bookkeeping: two sources for one
+// fact.
 function reportFalls() {
-  if (player.lastDrop > 0) toast("掉了 " + player.lastDrop.toFixed(1) + " m");
+  if (player.lastDrop > 0) toast("\u6389\u4e86 " + player.lastDrop.toFixed(1) + " m");
 }
 
 // ---------------------------------------------------------------- loop
@@ -1743,8 +1753,8 @@ function frame(now) {
   if (!last) last = now;
   var dt = (now - last) / 1000;
   last = now;
-  // A backgrounded tab throttles rAF; without this clamp the first frame back
-  // would teleport the animal through the tower.
+  // A backgrounded tab throttles rAF; without this clamp the first frame back would
+  // teleport the animal through the tower.
   if (dt > MAX_SUBSTEPS * FIXED_DT) dt = MAX_SUBSTEPS * FIXED_DT;
   if (dt > 0) { fpsAcc += dt; fpsN++; if (fpsAcc > 0.5) { fps = fpsN / fpsAcc; fpsAcc = 0; fpsN = 0; } }
   acc += dt;
@@ -1755,12 +1765,16 @@ function frame(now) {
     acc -= FIXED_DT; guard++; tickCount++;
   }
   if (acc > FIXED_DT * MAX_SUBSTEPS) acc = 0;
-  // Q/E share the mouse's sign convention: E (right) ADDS, exactly like a
-  // rightward pointer delta. Keeping the two paths expressed in the same terms is
-  // what stops them drifting apart the way they did in v2.0.
+  // Q/E share the mouse's sign convention: E (right) ADDS, exactly like a rightward
+  // pointer delta. Expressing both in the same terms is what stops them drifting
+  // apart the way they did in v2.0.
   var KEY_TURN = 1.9;
   if (keys.q) camYaw -= KEY_TURN * dt;
   if (keys.e) camYaw += KEY_TURN * dt;
+  // The pitch floor moves with the animal's height and the current distance, so
+  // re-clamp every frame rather than only when the mouse moves.
+  var lim = pitchLimits();
+  camPitch = clampPitch(camPitch, lim[0], lim[1]);
   reportFalls();
   updateAnimalVisuals(dt);
   if (toastT > 0) { toastT -= dt; if (toastT <= 0) elToast.style.opacity = "0"; }
@@ -1771,14 +1785,13 @@ function frame(now) {
 }
 window.addEventListener("error", function (e) { consoleErrors.push(String(e.message)); });
 
-// Read-only handle for tools/verify-browser.mjs. The browser gate drives the
-// game through REAL KeyboardEvents and only reads state through here, so the
-// input path is under test rather than mocked out.
+// Read-only handle for tools/verify-browser.mjs. The browser gate drives the game
+// through REAL key and mouse events and only reads state through here, so the input
+// path is under test rather than mocked out.
 //
-// nav() hands out RAW NUMBERS ONLY. The steering maths lives in the gate, not in
-// here: a helper that computed "which way should I go" inside the page would be
-// shipped code that only the test uses, and the test would then be grading the
-// helper instead of the game.
+// nav() hands out RAW NUMBERS ONLY. A helper that computed "which way should I go"
+// in the page would be shipped code only the test uses, and the test would then be
+// grading the helper instead of the game.
 window.__game = {
   version: BUILD_VERSION,
   get state() { return player; },
@@ -1787,13 +1800,21 @@ window.__game = {
   get errors() { return consoleErrors.slice(); },
   get camYaw() { return camYaw; },
   get camPitch() { return camPitch; },
-  get camDist() { return camDist; },
+  get camDist() { return view ? view.dist : camDist; },
   get pointerLocked() { return pointerLocked; },
+  get firstPerson() { return firstPerson; },
+  get pitchFloor() { return pitchLimits()[0]; },
+  setFirstPerson: setFirstPerson,
   level: {
     seed: level.seed, count: level.platforms.length,
     topY: level.topY, decorCount: level.decor.length,
     groundW: level.platforms[0].w, groundD: level.platforms[0].d
   },
+  // Which box the camera is inside, or null. Must always be null.
+  eyeInside: function () { return view ? eyeInsideBox(view, solidForCamera) : null; },
+  // Which platform the BODY is inside, or -1. Must always be -1.
+  bodyInside: function () { return insideAnyPlatform(player, level); },
+  horizonY: function () { return horizonY(view.pitch, H); },
   nav: function () {
     var i = player.groundIdx;
     var cur = level.platforms[i] || null;
@@ -1805,8 +1826,8 @@ window.__game = {
       next: nxt ? { x: nxt.x, y: nxt.y, z: nxt.z, w: nxt.w, d: nxt.d } : null
     };
   },
-  // Where the animal's head projects to right now, in CSS pixels. The browser
-  // gate asserts this sits inside the viewport: that is the check v1.0 lacked.
+  // Where the aim point projects, in CSS pixels. The browser gate asserts this sits
+  // inside the viewport: the check v1.0 lacked.
   aimPixel: function () {
     var o = [0, 0, 0];
     return projectPoint(view.target.x, view.target.y, view.target.z, view, o)
