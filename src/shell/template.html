@@ -400,14 +400,30 @@ window.addEventListener("error", function (e) { consoleErrors.push(String(e.mess
 // Read-only handle for tools/verify-browser.mjs. The browser gate drives the
 // game through REAL KeyboardEvents and only reads state through here, so the
 // input path is under test rather than mocked out.
+//
+// nav() hands out RAW NUMBERS ONLY. The steering maths lives in the gate, not in
+// here: a helper that computed "which way should I go" inside the page would be
+// shipped code that only the test uses, and the test would then be grading the
+// helper instead of the game.
 window.__game = {
   version: BUILD_VERSION,
   get state() { return player; },
   get ticks() { return tickCount; },
   get fps() { return fps; },
   get errors() { return consoleErrors.slice(); },
+  get camYaw() { return camYaw; },
   level: { seed: level.seed, count: level.platforms.length, topY: level.topY },
-  reachSample: function () { return { platforms: level.platforms.length }; }
+  nav: function () {
+    var i = player.groundIdx;
+    var cur = level.platforms[i] || null;
+    var nxt = level.platforms[Math.min(i + 1, level.platforms.length - 1)] || null;
+    return {
+      idx: i, onGround: player.onGround, camYaw: camYaw,
+      px: player.x, py: player.y, pz: player.z, bestY: player.bestY, falls: player.falls,
+      cur: cur ? { x: cur.x, y: cur.y, z: cur.z, w: cur.w, d: cur.d } : null,
+      next: nxt ? { x: nxt.x, y: nxt.y, z: nxt.z, w: nxt.w, d: nxt.d } : null
+    };
+  }
 };
 
 updateCamera();
