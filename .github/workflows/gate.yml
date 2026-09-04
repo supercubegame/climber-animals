@@ -1,8 +1,22 @@
 name: gate
 
+# WHY `push` IS LIMITED TO main:
+# It used to be branches: ['**'], so a branch with an open PR fired the whole
+# workflow TWICE for one commit -- once for push, once for pull_request. Both runs
+# write the same marked comment, so whichever finished last overwrote the other's
+# run id, and the loser's attest job then correctly reported "no comment for this
+# run" and went red. That is not a flaky check: two runs were genuinely fighting
+# over one report. The screenshot showed it exactly -- attest (push) green,
+# attest (pull_request) red, on the same commit.
+#
+# Branch pushes are still covered: while a PR is open, pull_request fires on every
+# push to its head. Pushes to a branch with NO open PR are the one gap, and that is
+# deliberate -- there is nowhere useful to report to yet, beyond the commit
+# comment. The `concurrency` group below cancels superseded runs of the same ref;
+# it does NOT help here because push and pull_request produce different group keys.
 on:
   push:
-    branches: ['**']
+    branches: [main]
   pull_request:
   workflow_dispatch:
   schedule:
@@ -89,7 +103,7 @@ jobs:
             const runId = context.runId;
             const fast = process.env.FAST || 'unknown';
             const browser = process.env.BROWSER || 'unknown';
-            const icon = (s) => (s === 'success' ? '✅' : s === 'skipped' ? '⏭️' : '❌');
+            const icon = (s) => (s === 'success' ? '\u2705' : s === 'skipped' ? '\u23ed\ufe0f' : '\u274c');
 
             const grab = (f) => {
               try { return fs.readFileSync('logs/' + f, 'utf8'); } catch { return ''; }
@@ -99,22 +113,22 @@ jobs:
             const failing = (t) => t.split('\n').filter((l) => l.startsWith('[FAIL]'));
             const tail = (t, n) => t.split('\n').slice(-n).join('\n');
 
-            let body = `${MARKER}\n### gate · \`${short}\` · run [${runId}](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${runId})\n\n`;
+            let body = `${MARKER}\n### gate \u00b7 \`${short}\` \u00b7 run [${runId}](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${runId})\n\n`;
             body += `| gate | result |\n|---|---|\n`;
             body += `| fast (pure core) | ${icon(fast)} ${fast} |\n| slow (headless Chromium) | ${icon(browser)} ${browser} |\n\n`;
 
             const fails = [...failing(fastLog), ...failing(browserLog)];
             if (fails.length) {
-              body += `**${fails.length} failing check(s)** — reason travels with the report, the raw CI log is not readable from the agent side:\n\n`;
+              body += `**${fails.length} failing check(s)** \u2014 reason travels with the report, the raw CI log is not readable from the agent side:\n\n`;
               body += '```\n' + fails.join('\n').slice(0, 5000) + '\n```\n\n';
             }
             for (const [name, text] of [['fast', fastLog], ['browser', browserLog]]) {
-              if (!text) { body += `_no ${name} log artifact reached this job — treat this run as NOT VERIFIED, not as healthy._\n\n`; continue; }
+              if (!text) { body += `_no ${name} log artifact reached this job \u2014 treat this run as NOT VERIFIED, not as healthy._\n\n`; continue; }
               body += `<details><summary>${name} gate log</summary>\n\n\`\`\`\n${tail(text, 70).slice(0, 12000)}\n\`\`\`\n\n</details>\n\n`;
             }
 
             const { owner, repo } = context.repo;
-            const upsert = async (list, create, update) => {
+            const upsert = async (fn, list, create, update) => {
               const existing = list.find((c) => c.body && c.body.includes(MARKER));
               if (existing) await update(existing.id); else await create();
             };
@@ -127,7 +141,7 @@ jobs:
             }
             if (prNumber) {
               const { data: comments } = await github.rest.issues.listComments({ owner, repo, issue_number: prNumber, per_page: 100 });
-              await upsert(comments,
+              await upsert(null, comments,
                 () => github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body }),
                 (id) => github.rest.issues.updateComment({ owner, repo, comment_id: id, body }));
               core.info('wrote PR comment on #' + prNumber);
@@ -137,13 +151,13 @@ jobs:
             // failure on the default branch would be invisible. Dedupe lives here
             // too: without it a re-run of the same sha silently doubles up.
             const { data: cc } = await github.rest.repos.listCommentsForCommit({ owner, repo, commit_sha: sha, per_page: 100 });
-            await upsert(cc,
+            await upsert(null, cc,
               () => github.rest.repos.createCommitComment({ owner, repo, commit_sha: sha, body }),
               (id) => github.rest.repos.updateCommitComment({ owner, repo, comment_id: id, body }));
             core.info('wrote commit comment on ' + short);
 
             if (fast !== 'success' || browser !== 'success') {
-              core.setFailed(`gate failed (fast=${fast}, browser=${browser}) — see the comment on ${short}`);
+              core.setFailed(`gate failed (fast=${fast}, browser=${browser}) \u2014 see the comment on ${short}`);
             }
 
   attest:
@@ -162,6 +176,12 @@ jobs:
 
             // Pinned to THIS run: "a comment with the marker exists" is the classic
             // idempotent-write false green, it stays true forever after run #1.
+            //
+            // Pinning is also why duplicate runs for one commit are fatal rather
+            // than merely wasteful: two runs write the same comment, the later one
+            // wins, and the earlier one's attest correctly cannot find its own id.
+            // That is fixed at the trigger (see the header comment), not by relaxing
+            // this check -- relaxing it would restore the false green it exists for.
             const matches = (c) => c.body && c.body.includes(MARKER) && c.body.includes(runId);
 
             const findCommit = async (marker) => {
@@ -171,7 +191,7 @@ jobs:
 
             // Self-test: the same finder must return 0 for a marker that cannot exist.
             const impossible = await findCommit('<!-- marker-that-cannot-exist-' + runId + ' -->');
-            if (impossible !== 0) core.setFailed(`finder returned ${impossible} for an impossible marker — it is not actually reading anything`);
+            if (impossible !== 0) core.setFailed(`finder returned ${impossible} for an impossible marker \u2014 it is not actually reading anything`);
 
             let prNumber = context.payload.pull_request && context.payload.pull_request.number;
             if (!prNumber) {
@@ -191,6 +211,6 @@ jobs:
             }
 
             core.info(`attempt summary: commit=${commitFound} pr=${prFound} prNumber=${prNumber || 'none'}`);
-            if (commitFound === 0) core.setFailed('no commit comment for this run — the gate result was never delivered, so this run verified nothing readable');
-            if (prNumber && prFound === 0) core.setFailed(`no PR comment on #${prNumber} for this run — the PR channel is broken even though the commit channel worked`);
-            if (commitFound > 1) core.setFailed(`${commitFound} commit comments for one run — dedupe is broken and the log will drown in duplicates`);
+            if (commitFound === 0) core.setFailed('no commit comment for this run \u2014 the gate result was never delivered, so this run verified nothing readable');
+            if (prNumber && prFound === 0) core.setFailed(`no PR comment on #${prNumber} for this run \u2014 the PR channel is broken even though the commit channel worked`);
+            if (commitFound > 1) core.setFailed(`${commitFound} commit comments for one run \u2014 dedupe is broken and the log will drown in duplicates`);
