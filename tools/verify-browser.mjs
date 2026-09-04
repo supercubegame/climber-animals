@@ -239,7 +239,7 @@ metrics.autopilotPollMs = Math.round(24000 / Math.max(1, run.samples));
 // pure core reaches platform 23 / 23.6m in 24s with zero falls, and holds 22-23
 // across every poll interval from 20ms to 140ms. Floors are half that. The 24s
 // budget includes ~4s of walking across the farmyard before the first jump.
-// CI on 2026-09-04 measured 23 / 23.42m, so the offline predictor is trustworthy.
+// CI on 2026-09-04 measured 23 / 23.61m, so the offline predictor is trustworthy.
 const CLIMB_IDX_FLOOR = 11;
 const CLIMB_Y_FLOOR = 11;
 const climbed = run.maxIdx >= CLIMB_IDX_FLOOR && run.end.bestY >= CLIMB_Y_FLOOR;
@@ -275,16 +275,33 @@ record('loop:fps-alive', after.fps > 5,
 // See docs/PITFALLS.md.
 
 // Helper: drag on the CANVAS with real events, returning the camera delta.
-// Measured before mouseup on purpose, so the click that re-arms pointer lock
-// cannot contaminate the reading.
+//
+// It releases pointer lock FIRST, every single time. Round two of this test still
+// measured the lock path by accident: releasing the mouse button fires a click,
+// the shell arms the lock on canvas click, so drag B's own mouseup re-armed it and
+// drag C ran locked. The symptom was unmistakable once the numbers were printed --
+// pitch pinned at exactly 0.020 (the clamp minimum) while yaw moved 1.536 rad,
+// which is 640 x MOUSE_SENS_X, i.e. a movementX of 640 rather than the 420px this
+// drag actually travelled. Under lock the shell reads movementX/movementY, and
+// Puppeteer's absolute-coordinate moves do not produce the deltas you asked for.
+//
+// It also reads the camera BEFORE mouseup, so the re-arming click cannot
+// contaminate this reading either, and it reports the lock state so a future
+// regression says "measured the wrong path" instead of "pitch is broken".
 async function dragBy(page, from, to, steps = 10) {
+  await page.evaluate(() => { if (document.pointerLockElement && document.exitPointerLock) document.exitPointerLock(); });
+  await sleep(220);
+  const lockedAtStart = await page.evaluate(() => window.__game.pointerLocked);
   const before = await page.evaluate(() => ({ yaw: window.__game.camYaw, pitch: window.__game.camPitch }));
   await page.mouse.move(from[0], from[1]);
   await page.mouse.down();
   await page.mouse.move(to[0], to[1], { steps });
   const mid = await page.evaluate(() => ({ yaw: window.__game.camYaw, pitch: window.__game.camPitch, locked: window.__game.pointerLocked }));
   await page.mouse.up();
-  return { before, after: mid, dYaw: mid.yaw - before.yaw, dPitch: mid.pitch - before.pitch, locked: mid.locked };
+  return {
+    before, after: mid, lockedAtStart,
+    dYaw: mid.yaw - before.yaw, dPitch: mid.pitch - before.pitch, locked: mid.locked,
+  };
 }
 
 // A. pointer lock path. Click to arm, then move with no button held.
@@ -305,15 +322,12 @@ record('input:pointer-lock-look',
     ? `lock GRANTED and bare mouse movement turned the camera by ${lockYawDelta.toFixed(3)} rad (floor 0.1). This is the path a real Edge session takes.`
     : `lock NOT granted by this headless browser, so continuous look was NOT verified this run (yaw moved ${lockYawDelta.toFixed(3)} rad). The drag fallback below was verified; only a real browser settles this one.`);
 
-// B. drag fallback, in isolation, with the lock definitely released.
-await page.evaluate(() => { if (document.exitPointerLock) document.exitPointerLock(); });
-await sleep(250);
-const stillLocked = await page.evaluate(() => window.__game.pointerLocked);
+// B. drag fallback, in isolation. dragBy releases the lock itself.
 const dragX = await dragBy(page, [400, 400], [760, 400]);   // horizontal: yaw
 metrics.dragYawDelta = +dragX.dYaw.toFixed(3);
-record('input:drag-look-turns-yaw', !stillLocked && Math.abs(dragX.dYaw) > 0.2,
-  stillLocked
-    ? 'pointer lock was still held after exitPointerLock(), so this measured the lock path rather than the drag path'
+record('input:drag-look-turns-yaw', !dragX.lockedAtStart && !dragX.locked && Math.abs(dragX.dYaw) > 0.2,
+  (dragX.lockedAtStart || dragX.locked)
+    ? `pointer lock was active during this drag (start ${dragX.lockedAtStart}, end ${dragX.locked}), so it measured the lock path rather than the drag path`
     : `dragged 360px horizontally on the canvas: yaw ${dragX.before.yaw.toFixed(3)} \u2192 ${dragX.after.yaw.toFixed(3)} (\u0394 ${dragX.dYaw.toFixed(3)} rad, floor 0.2), pitch untouched at ${dragX.after.pitch.toFixed(3)}`);
 
 // C. pitch responds to vertical drag. Direction is not asserted: the starting
@@ -322,8 +336,11 @@ record('input:drag-look-turns-yaw', !stillLocked && Math.abs(dragX.dYaw) > 0.2,
 await sleep(120);
 const dragY = await dragBy(page, [640, 200], [640, 620]);   // vertical: pitch
 metrics.dragPitchDelta = +dragY.dPitch.toFixed(3);
-record('input:drag-look-turns-pitch', Math.abs(dragY.dPitch) > 0.1,
-  `dragged 420px vertically: pitch ${dragY.before.pitch.toFixed(3)} \u2192 ${dragY.after.pitch.toFixed(3)} (\u0394 ${dragY.dPitch.toFixed(3)}, floor 0.1); yaw moved ${dragY.dYaw.toFixed(3)}`);
+metrics.dragPitchLocked = dragY.lockedAtStart || dragY.locked;
+record('input:drag-look-turns-pitch', !dragY.lockedAtStart && !dragY.locked && Math.abs(dragY.dPitch) > 0.1,
+  (dragY.lockedAtStart || dragY.locked)
+    ? `pointer lock was active during this drag (start ${dragY.lockedAtStart}, end ${dragY.locked}), so it measured the lock path, not the drag path. That is the failure, not the camera.`
+    : `dragged 420px vertically on the canvas: pitch ${dragY.before.pitch.toFixed(3)} \u2192 ${dragY.after.pitch.toFixed(3)} (\u0394 ${dragY.dPitch.toFixed(3)}, floor 0.1); yaw moved ${dragY.dYaw.toFixed(3)}`);
 
 // D. the clamp itself. Drag far past both limits and require the bounds to hold.
 //    Separately require that the two extremes DIFFER, otherwise a camera frozen
