@@ -26,10 +26,15 @@ export function rayExitXZ(w, d, dx, dz) {
   return Math.min(tx, tz);
 }
 
-// The farmyard you spawn on. Big enough to read as a place rather than a pad,
-// which also means the tower's first platform is generated ~half its width out,
-// so you walk across the farm to reach the base. GROUND_SIZE is coupled to that
-// walk: the reachability scan launches hop 0 from the ground's ray exit.
+// The FARMYARD FOOTPRINT: the area scenery is placed in, and the box the
+// reachability scan launches hop 0 from. It is not the edge of the world.
+//
+// The ground plane itself is INFINITE (platform 0 carries `infinite: true`, and
+// stepPlayer treats such a platform as solid at every x/z). v2.0 had a 26x26 slab
+// with a visible edge you could walk off, which reads as a bug rather than a
+// boundary. The shell draws the grass as a tile centred on the player, so it
+// extends forever as you move; `level:ground-is-infinite` proves the physics
+// agrees with what is drawn, which is the pairing that actually matters.
 export const GROUND_SIZE = 26;
 
 // kind -> [minSize, maxSize, minThickness, maxThickness, colour]
@@ -94,8 +99,17 @@ function makeDecor(rnd, towerDx, towerDz) {
   const bx = ax * (half - 3.4) + px * 2.6;
   const bz = az * (half - 3.4) + pz * 2.6;
   add('barn', bx, bz, 6.4, 4.2, 5.0, '#b5433a');
-  add('barnroof', bx, bz, 7.0, 1.3, 5.6, '#7d2f2a', 4.2);
+  // roof as two stacked slabs, narrowing upward: reads as a pitch, not a lid
+  add('barnroof', bx, bz, 7.0, 0.7, 5.6, '#7d2f2a', 4.2);
+  add('barnroof', bx, bz, 5.2, 0.7, 4.2, '#8f382e', 4.9);
   add('barndoor', bx - ax * 2.4, bz - az * 2.4, 1.9, 2.7, 1.9, '#e8d9bb');
+  add('barntrim', bx - ax * 2.42, bz - az * 2.42, 2.4, 0.22, 2.4, '#f2e6cd', 2.7);
+  // chimney: the smoke plume in the shell reads level.chimney, so the plume and the
+  // box it rises from cannot drift apart. `decor:chimney-anchors-the-smoke` asserts
+  // the anchor exists and sits on top of the chimney box.
+  const chx = bx + px * 2.0, chz = bz + pz * 2.0;
+  add('chimney', chx, chz, 0.7, 1.5, 0.7, '#8a4b3c', 4.9);
+  items.chimney = { x: chx, z: chz, top: 6.4 };
 
   // silo beside it, with a cap
   const sx = ax * (half - 2.6) - px * 5.0;
@@ -139,17 +153,73 @@ function makeDecor(rnd, towerDx, towerDz) {
     add('crown', tx, tz, 1.9 + rnd() * 0.7, 1.7 + rnd() * 0.6, 1.9 + rnd() * 0.7, '#4f9a52', th);
   }
 
-  // fence posts + rails along the rim, same wedge skipped so you can walk out
-  const N = 30;
+  // crop rows, so the yard has texture between the buildings
+  for (let row = 0; row < 3; row++) {
+    for (let i = 0; i < 6; i++) {
+      const cx = px * (4.2 + row * 1.5) - ax * (half - 5.5) + ax * i * 1.35;
+      const cz = pz * (4.2 + row * 1.5) - az * (half - 5.5) + az * i * 1.35;
+      add('crop', cx, cz, 0.5, 0.42 + rnd() * 0.2, 0.5, row === 1 ? '#6fae54' : '#7cbb5e');
+    }
+  }
+  // a cart by the barn: two wheels and a bed
+  const cx0 = bx - ax * 4.6 - px * 1.2, cz0 = bz - az * 4.6 - pz * 1.2;
+  add('cartbed', cx0, cz0, 1.9, 0.30, 1.2, '#a9793f', 0.45);
+  add('cartwheel', cx0 - px * 0.65, cz0 - pz * 0.65, 0.55, 0.55, 0.16, '#6b4a2f');
+  add('cartwheel', cx0 + px * 0.65, cz0 + pz * 0.65, 0.55, 0.55, 0.16, '#6b4a2f');
+
+  // fence posts + rails along the rim, with a proper GATE in the tower wedge:
+  // two tall posts flanking the gap, so the opening looks intended rather than
+  // like a missing section of fence.
+  const N = 34;
   for (let i = 0; i < N; i++) {
     const a = (i / N) * Math.PI * 2;
     const dx = Math.cos(a), dz = Math.sin(a);
-    if (dx * towerDx + dz * towerDz > 0.62) continue;
+    const towardTower = dx * towerDx + dz * towerDz;
+    if (towardTower > 0.62) continue;
     const r = half - 0.6;
     add('post', dx * r, dz * r, 0.2, 1.05, 0.2, '#efe7d6');
     add('rail', dx * r, dz * r, Math.abs(dz) * 1.9 + 0.16, 0.13, Math.abs(dx) * 1.9 + 0.16, '#efe7d6', 0.62);
+    add('rail', dx * r, dz * r, Math.abs(dz) * 1.9 + 0.16, 0.12, Math.abs(dx) * 1.9 + 0.16, '#e6dcc6', 0.30);
+    if (towardTower > 0.50) {
+      add('gatepost', dx * r, dz * r, 0.34, 1.75, 0.34, '#d8cbaf');
+      add('gatecap', dx * r, dz * r, 0.5, 0.18, 0.5, '#b59a72', 1.75);
+    }
   }
   return items;
+}
+
+/**
+ * Drifting clouds. Position is `x + drift * t` where t is the player's simulated
+ * time, which the CORE owns -- so the sky is animated and still perfectly
+ * deterministic. Using Date.now() here would have broken every replay assertion.
+ * `wrap` is the span the x position is taken modulo, so a cloud that sails off one
+ * side reappears on the other instead of the sky slowly emptying.
+ */
+export const CLOUD_WRAP = 340;
+
+function makeClouds(rnd, topY) {
+  const clouds = [];
+  for (let i = 0; i < 34; i++) {
+    const y = 8 + rnd() * (topY + 40);
+    const scale = 0.7 + rnd() * 1.9;
+    clouds.push({
+      x: rnd() * CLOUD_WRAP - CLOUD_WRAP / 2,
+      y,
+      z: (rnd() - 0.5) * 240,
+      w: 7 * scale, h: 1.5 * scale, d: 4.2 * scale,
+      drift: 0.5 + rnd() * 1.5,          // units per simulated second, always +x
+      puffs: 2 + Math.floor(rnd() * 3),
+    });
+  }
+  return clouds;
+}
+
+/** Pure: the same t always gives the same sky. */
+export function cloudX(cloud, t) {
+  const span = CLOUD_WRAP;
+  let x = cloud.x + cloud.drift * t;
+  x = ((x + span / 2) % span + span) % span - span / 2;
+  return x;
 }
 
 /**
@@ -172,6 +242,7 @@ export function makeLevel(seed = DEFAULT_SEED, opts = {}) {
     i: 0, kind: 'ground', color: g[4],
     x: 0, y: 0, z: 0, w: g[0], d: g[1], h: g[2],
     gapY: 0, gapXZ: 0, label: 'Farm Yard',
+    infinite: true,   // solid at every x/z; w/d are the scenery footprint only
   });
 
   let angle = rnd() * Math.PI * 2;
@@ -216,10 +287,14 @@ export function makeLevel(seed = DEFAULT_SEED, opts = {}) {
   const p1 = platforms[1] || { x: 1, z: 0 };
   const tl = Math.hypot(p1.x, p1.z) || 1;
 
+  const decor = makeDecor(rnd, p1.x / tl, p1.z / tl);
+
   return {
     seed,
     platforms,
-    decor: makeDecor(rnd, p1.x / tl, p1.z / tl),
+    decor,
+    chimney: decor.chimney || null,
+    clouds: makeClouds(rnd, top.y),
     spawn: { x: 0, y: 0, z: 0 },
     topY: top.y,
     topIndex: top.i,
