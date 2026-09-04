@@ -13,7 +13,7 @@ or copy one onto the other.
 
 ```
 node tools/build.mjs          # regenerate climber-animals.html from src/
-node tools/verify.mjs         # fast gate: 21 checks, zero deps, ~1s
+node tools/verify.mjs         # fast gate: zero deps, ~1s. It prints its own count.
 node tools/verify-browser.mjs # slow gate: headless Chromium, needs puppeteer
 ```
 
@@ -97,6 +97,13 @@ Any new verifiable behaviour gets an assertion in the same push. Before trusting
 a new one, break the thing on purpose and confirm it goes red — an assertion that
 has never failed has never been tested. If a rule here gets violated twice, it
 belongs in the gate rather than in this file.
+
+## Do not write counts into prose
+
+No "N checks", no file counts, no job counts anywhere in this file, the README or
+docs/. A number in prose does not get updated when the thing it describes changes,
+and a stale explanation is worse than no explanation. The gate prints its own
+totals and its own measured values; quote those instead.
 
 ## Known gaps
 

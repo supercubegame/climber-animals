@@ -46,7 +46,7 @@ state. The same seed always builds the same tower.
 
 ```bash
 node tools/build.mjs     # regenerate climber-animals.html from src/
-node tools/verify.mjs    # fast gate: 22 checks, zero dependencies, ~1s
+node tools/verify.mjs    # fast gate: zero dependencies, ~1s
 npm i puppeteer && node tools/verify-browser.mjs   # slow gate: headless Chromium
 ```
 
@@ -55,10 +55,10 @@ npm i puppeteer && node tools/verify-browser.mjs   # slow gate: headless Chromiu
 against a fresh build, so a hand-edit turns CI red.
 
 The gate's load-bearing check is `reach:every-segment-playable`: it replays every
-single hop in the tower with the real physics step and a steering controller, over
-six seeds and 900 segments, and fails if any platform is unreachable. Four
-deliberately impossible variants must make it fail, which is what keeps it from
-degrading into a decoration.
+single hop in the tower with the real physics step and a steering controller,
+across several seeds, and fails if any platform is unreachable. Deliberately
+impossible variants must make it fail, which is what keeps it from degrading into
+a decoration.
 
 See `AGENTS.md` for the invariants and coupled parameters, and `docs/PITFALLS.md`
 for what went wrong on the way here and what this project genuinely cannot verify.
