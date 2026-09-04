@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Climber Animals: Together — v1.0</title>
+<title>Climber Animals: Together — v2.0</title>
 <style>
   html,body{margin:0;height:100%;overflow:hidden;background:#0d1b2a;
     font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif;color:#fff;
@@ -31,6 +31,9 @@
   #banner .h{font-size:40px;font-weight:800;margin-bottom:6px}
   #toast{left:50%;bottom:26px;transform:translateX(-50%);font-size:14px;
     padding:8px 18px;opacity:0;transition:opacity .35s}
+  #lock{left:50%;top:50%;transform:translate(-50%,-50%);text-align:center;
+    padding:16px 26px;cursor:pointer;transition:opacity .25s}
+  #lock.hidden{opacity:0;pointer-events:none}
 </style>
 </head>
 <body>
@@ -50,11 +53,17 @@
 </div>
 
 <div id="keys" class="panel">
-  <div><b>W A S D</b>移动</div>
+  <div><b>W A S D</b>移动（跟着镜头方向）</div>
   <div><b>Space</b>跳（只有落地时能跳）</div>
-  <div><b>Q E</b>转视角 &nbsp;<b>拖鼠标</b>也行</div>
+  <div><b>移动鼠标</b>转视角（点一下画面先锁定）</div>
+  <div><b>Q E</b>左右转 &nbsp;<b>滚轮</b>拉远拉近</div>
   <div><b>1 2 3 4</b>换动物 &nbsp;<b>R</b>回农场重来</div>
   <div style="opacity:.62;margin-top:6px">没有存档点。掉下去就得重爬。</div>
+</div>
+
+<div id="lock" class="panel">
+  <div style="font-size:15px;font-weight:700;margin-bottom:2px">点一下画面，鼠标就能直接转视角</div>
+  <div style="opacity:.7;font-size:12.5px">锁定后移动鼠标即可环视，按 Esc 解除</div>
 </div>
 
 <div id="banner" class="panel">
@@ -128,28 +137,245 @@ const REST_EVERY = 12;       // landmark / breather platform cadence
 const FLOOR_Y = -4;          // below this you are put back in the farm yard
 const DEFAULT_SEED = 20260904;
 
-// ---- src/core/level.mjs ----
-// Support function of an axis-aligned box along a unit direction. Exact, so the
-// centre-line edge gap between two consecutive platforms is exactly `gapXZ`
-// (separating axis theorem), never a diagonal surprise. Getting this wrong is
-// how you end up with platforms that silently overlap and a "climb" you can walk.
-function extentAlong(w, d, dx, dz) {
-  return (w / 2) * Math.abs(dx) + (d / 2) * Math.abs(dz);
+// ---- src/core/camera.mjs ----
+// Camera + projection. Lives in the PURE CORE (no DOM, no canvas) precisely so
+// the fast gate can assert where things land on screen. The previous version of
+// this maths lived in the shell where nothing could test it, carried a comment
+// claiming it was "derived, not guessed", and was wrong: see docs/PITFALLS.md.
+
+const CAM_FOV = 0.52;           // half-angle, radians
+const CAM_TARGET_LIFT = 1.25;   // aim above the animal's feet
+const CAM_DIST_MIN = 5;
+const CAM_DIST_MAX = 16;
+const CAM_DIST_DEFAULT = 9.2;
+// Pitch is how far ABOVE the target the camera sits. 0 = level with it.
+// Upper bound stops short of straight down, where yaw becomes meaningless.
+const CAM_PITCH_MIN = 0.02;
+const CAM_PITCH_MAX = 1.15;
+const CAM_PITCH_DEFAULT = 0.30;
+const MOUSE_SENS_X = 0.0024;    // radians per pixel of pointer movement
+const MOUSE_SENS_Y = 0.0018;
+
+const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
+const clampPitch = (p) => clamp(p, CAM_PITCH_MIN, CAM_PITCH_MAX);
+const clampDist = (d) => clamp(d, CAM_DIST_MIN, CAM_DIST_MAX);
+const focalFor = (h) => (h / 2) / Math.tan(CAM_FOV);
+
+/**
+ * Orbit position: `dist` away from the target, `pitch` above it, `yaw` around it.
+ * The forward unit vector eye->target is therefore
+ *     (sin yaw · cos pitch, -sin pitch, cos yaw · cos pitch)
+ * which is what the rotation below has to map onto +Z.
+ */
+function cameraEye(tx, ty, tz, yaw, pitch, dist) {
+  const cp = Math.cos(pitch);
+  return {
+    x: tx - Math.sin(yaw) * cp * dist,
+    y: ty + Math.sin(pitch) * dist,
+    z: tz - Math.cos(yaw) * cp * dist,
+  };
 }
 
 /**
- * How far you can actually WALK from the centre of a platform along (dx,dz)
- * before your feet leave it: the ray-box exit distance.
+ * World -> camera space. Yaw about +Y, then pitch about +X, chosen so that the
+ * forward vector above lands exactly on (0, 0, dist).
  *
- * This is NOT extentAlong(). On a 7x7 pad heading 20 degrees off axis the
- * projection width says 4.49 while the ray exits at 3.72, and the reachability
- * scan used to launch every hop from the projection width -- i.e. from a point
- * outside the pad, hanging in mid-air, closer to the target than any player can
- * stand. Use extentAlong for SEPARATION, this for STANDING ROOM.
+ * Yaw:   x1 = dx·cos y − dz·sin y      z1 = dx·sin y + dz·cos y
+ *   forward gives x1 = cp(sin y cos y − cos y sin y) = 0, z1 = cp = cos pitch.
+ * Pitch: y2 = dy·cos p + z1·sin p      z2 = −dy·sin p + z1·cos p
+ *   with dy = −sin p·dist: y2 = dist(−sin p cos p + cos p sin p) = 0
+ *                          z2 = dist(sin²p + cos²p) = dist
  *
- * They coincide on axis AND at exactly 45 degrees on a square, so never sanity
- * check the pair with a single angle. Worst divergence found by sweeping: 1.41
- * on a 6x2 box at 45 degrees.
+ * THE PITCH SIGNS ARE THE WHOLE BUG. Flip them (y2 = dy·cos p − z1·sin p) and
+ * the camera still sits above the target but tilts further UP, throwing the
+ * target off the bottom of the viewport while the scene still looks plausible.
+ * `camera:target-lands-dead-centre` pins this down; a mutant proves it fails.
+ */
+function toCameraSpace(px, py, pz, eye, yaw, pitch, out) {
+  const dx = px - eye.x, dy = py - eye.y, dz = pz - eye.z;
+  const cy = Math.cos(yaw), sy = Math.sin(yaw);
+  const x1 = dx * cy - dz * sy;
+  const z1 = dx * sy + dz * cy;
+  const cpp = Math.cos(pitch), spp = Math.sin(pitch);
+  out[0] = x1;
+  out[1] = dy * cpp + z1 * spp;
+  out[2] = -dy * spp + z1 * cpp;
+  return out;
+}
+
+const NEAR_Z = 0.12;
+
+/** Builds everything a frame needs, so the shell keeps no camera maths of its own. */
+function makeView(tx, ty, tz, yaw, pitch, dist, w, h) {
+  return {
+    eye: cameraEye(tx, ty + CAM_TARGET_LIFT, tz, yaw, pitch, dist),
+    yaw, pitch, dist, w, h,
+    focal: focalFor(h),
+    target: { x: tx, y: ty + CAM_TARGET_LIFT, z: tz },
+  };
+}
+
+const _v = [0, 0, 0];
+
+/** Returns false when the point is at or behind the near plane. */
+function projectPoint(px, py, pz, view, out) {
+  toCameraSpace(px, py, pz, view.eye, view.yaw, view.pitch, _v);
+  if (_v[2] < NEAR_Z) return false;
+  out[0] = view.w / 2 + (_v[0] * view.focal) / _v[2];
+  out[1] = view.h / 2 - (_v[1] * view.focal) / _v[2];
+  out[2] = _v[2];
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Box geometry. Lives here, not in the shell, so the gate can assert what ends
+// up on screen instead of trusting a renderer nobody can test.
+//
+// Convention, shared with platforms: a box's TOP face sits at y, and it extends
+// DOWN by h. Anything meant to rest on the ground therefore needs y = its own
+// height, not y = 0. Getting that backwards buries the whole object; see
+// docs/PITFALLS.md.
+// ---------------------------------------------------------------------------
+
+const BOX_CORNERS = [
+  [-1, 0, -1], [1, 0, -1], [1, 0, 1], [-1, 0, 1],
+  [-1, -1, -1], [1, -1, -1], [1, -1, 1], [-1, -1, 1],
+];
+const BOX_FACES = [
+  { idx: [0, 1, 2, 3], n: [0, 1, 0], lit: 1.06 },
+  { idx: [3, 2, 6, 7], n: [0, 0, 1], lit: 0.80 },
+  { idx: [1, 0, 4, 5], n: [0, 0, -1], lit: 0.62 },
+  { idx: [2, 1, 5, 6], n: [1, 0, 0], lit: 0.90 },
+  { idx: [0, 3, 7, 4], n: [-1, 0, 0], lit: 0.70 },
+];
+
+/**
+ * Sutherland-Hodgman clip of a camera-space polygon against z >= NEAR_Z.
+ *
+ * This exists because the obvious alternative -- "if any corner is behind the
+ * camera, skip the box" -- silently deletes exactly the geometry you are standing
+ * on. A 26-unit farmyard viewed from 9 units up has its near corners behind the
+ * eye, so the entire ground plane vanished and the animal appeared to float in
+ * the sky. Small boxes never triggered it, which is why it hid through v1.0.
+ */
+function clipNearZ(poly, near = NEAR_Z) {
+  const out = [];
+  const n = poly.length;
+  for (let i = 0; i < n; i++) {
+    const a = poly[i], b = poly[(i + 1) % n];
+    const ain = a[2] >= near, bin = b[2] >= near;
+    if (ain) out.push(a);
+    if (ain !== bin) {
+      const t = (near - a[2]) / (b[2] - a[2]);
+      out.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, near]);
+    }
+  }
+  return out;
+}
+
+function polygonArea(pts) {
+  let a = 0;
+  for (let i = 0, n = pts.length; i < n; i++) {
+    const p = pts[i], q = pts[(i + 1) % n];
+    a += p[0] * q[1] - q[0] * p[1];
+  }
+  return Math.abs(a) / 2;
+}
+
+const _corner = [0, 0, 0];
+
+/**
+ * Screen polygons for the visible faces of an axis-aligned box, near-plane
+ * clipped. Returns [{ lit, pts:[[x,y],...] }, ...]; empty when nothing shows.
+ */
+function boxScreenFaces(x, y, z, w, h, d, view) {
+  const hw = w / 2, hd = d / 2;
+  const eye = view.eye;
+  const cam = [];
+  for (let i = 0; i < 8; i++) {
+    const c = BOX_CORNERS[i];
+    toCameraSpace(x + c[0] * hw, y + c[1] * h, z + c[2] * hd, eye, view.yaw, view.pitch, _corner);
+    cam.push([_corner[0], _corner[1], _corner[2]]);
+  }
+  const faces = [];
+  for (let f = 0; f < BOX_FACES.length; f++) {
+    const face = BOX_FACES[f], n = face.n;
+    // Back-face cull in WORLD space: cheaper than a normal transform and exact
+    // for axis-aligned boxes.
+    let vis;
+    if (n[1] === 1) vis = eye.y > y;
+    else if (n[0] !== 0) vis = (eye.x - x) * n[0] > hw;
+    else vis = (eye.z - z) * n[2] > hd;
+    if (!vis) continue;
+    const clipped = clipNearZ([cam[face.idx[0]], cam[face.idx[1]], cam[face.idx[2]], cam[face.idx[3]]]);
+    if (clipped.length < 3) continue;
+    const pts = [];
+    for (let k = 0; k < clipped.length; k++) {
+      const v = clipped[k];
+      pts.push([view.w / 2 + (v[0] * view.focal) / v[2], view.h / 2 - (v[1] * view.focal) / v[2]]);
+    }
+    faces.push({ lit: face.lit, pts });
+  }
+  return faces;
+}
+
+/** Sutherland-Hodgman clip of a 2D polygon to the viewport rectangle. */
+function clipToRect(pts, w, h) {
+  const edges = [
+    (p) => p[0] >= 0, (p) => p[0] <= w, (p) => p[1] >= 0, (p) => p[1] <= h,
+  ];
+  const cross = [
+    (a, b) => (0 - a[0]) / (b[0] - a[0]), (a, b) => (w - a[0]) / (b[0] - a[0]),
+    (a, b) => (0 - a[1]) / (b[1] - a[1]), (a, b) => (h - a[1]) / (b[1] - a[1]),
+  ];
+  let poly = pts;
+  for (let e = 0; e < 4; e++) {
+    const inside = edges[e], at = cross[e];
+    const next = [];
+    for (let i = 0, n = poly.length; i < n; i++) {
+      const a = poly[i], b = poly[(i + 1) % n];
+      const ain = inside(a), bin = inside(b);
+      if (ain) next.push(a);
+      if (ain !== bin) {
+        const t = at(a, b);
+        next.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]);
+      }
+    }
+    poly = next;
+    if (poly.length === 0) return poly;
+  }
+  return poly;
+}
+
+/**
+ * Fraction of the viewport a box actually paints, 0..1. Clipping to the rect
+ * matters: a face clipped to the near plane projects to coordinates thousands of
+ * pixels wide, so raw polygon area is meaningless as a measure of what you see.
+ */
+function screenCoverage(faces, w, h) {
+  let a = 0;
+  for (let i = 0; i < faces.length; i++) {
+    const c = clipToRect(faces[i].pts, w, h);
+    if (c.length >= 3) a += polygonArea(c);
+  }
+  return a / (w * h);
+}
+
+// ---- src/core/level.mjs ----
+/**
+ * How far you can WALK from the centre of a box along (dx,dz) before your feet
+ * leave it: the ray-box exit distance. THE one measure of horizontal distance in
+ * this game, used for placement, for the reachability scan's launch point, and by
+ * the browser autopilot.
+ *
+ * It replaced a projection width (`(w/2)|dx| + (d/2)|dz|`) that was doing both
+ * jobs badly. For two boxes whose ray exit picks the same world axis -- which is
+ * every same-ish-aspect pair, including all of this level's -- the sum of their
+ * ray exits IS the exact touching distance on that axis, so `rayExit + gap +
+ * rayExit` separates them correctly AND makes `gap` the real walkable gap. The
+ * projection width is strictly larger on diagonals, so using it inflated the true
+ * gap by up to 2.9 units on the 26-unit farmyard: far past anything the jump arc
+ * was tuned for. See docs/PITFALLS.md.
  */
 function rayExitXZ(w, d, dx, dz) {
   const ax = Math.abs(dx), az = Math.abs(dz);
@@ -158,9 +384,15 @@ function rayExitXZ(w, d, dx, dz) {
   return Math.min(tx, tz);
 }
 
+// The farmyard you spawn on. Big enough to read as a place rather than a pad,
+// which also means the tower's first platform is generated ~half its width out,
+// so you walk across the farm to reach the base. GROUND_SIZE is coupled to that
+// walk: the reachability scan launches hop 0 from the ground's ray exit.
+const GROUND_SIZE = 26;
+
 // kind -> [minSize, maxSize, minThickness, maxThickness, colour]
 const KINDS = {
-  ground:     [7.0, 7.0, 0.8, 0.8, '#8fc866'],
+  ground:     [GROUND_SIZE, GROUND_SIZE, 0.8, 0.8, '#8fc866'],
   hay:        [1.7, 2.6, 0.7, 1.1, '#e0b962'],
   crate:      [1.6, 2.2, 0.7, 1.0, '#b3773d'],
   barrel:     [1.6, 2.0, 0.9, 1.3, '#c2543f'],
@@ -187,6 +419,95 @@ const SKY_Y = 42;
 
 function pick(rnd, arr) {
   return arr[Math.floor(rnd() * arr.length) % arr.length];
+}
+
+/**
+ * Scenery. NOT collidable and never consulted by stepPlayer -- the physics loop
+ * only ever iterates level.platforms. `decor:does-not-affect-physics` proves it
+ * by hashing a long run with and without decor and requiring the hashes match,
+ * plus a discrimination case where decor IS made collidable and the hash moves.
+ *
+ * Large items are pushed into the hemisphere AWAY from the tower's first
+ * platform so the barn never grows through the climbing route.
+ */
+function makeDecor(rnd, towerDx, towerDz) {
+  const items = [];
+  const half = GROUND_SIZE / 2;
+  // `add` takes the height and derives the TOP, because a box hangs DOWN from
+  // its y. Passing y = 0 for something standing on the ground buries it: the
+  // first version of this function did exactly that and every tree, fence and
+  // barn ended up underground. See docs/PITFALLS.md.
+  const add = (kind, x, z, w, h, d, color, base) =>
+    items.push({ kind, x, y: (base || 0) + h, z, w, h, d, color, base: base || 0 });
+
+  // Away-direction, used as the anchor for the big buildings.
+  const ax = -towerDx, az = -towerDz;
+  const px = -az, pz = ax;             // perpendicular, for spreading them out
+
+  // Everything tall lives on the RIM, and the wedge the tower climbs through is
+  // skipped, so the middle of the yard and the walk-out lane stay clear. Decor is
+  // scenery you can walk through -- keeping it out of the route is what stops that
+  // from being noticeable. `decor:walk-out-lane-is-clear` holds the line.
+  // barn: body, roof slab sitting on top of it, and a pale door
+  const bx = ax * (half - 3.4) + px * 2.6;
+  const bz = az * (half - 3.4) + pz * 2.6;
+  add('barn', bx, bz, 6.4, 4.2, 5.0, '#b5433a');
+  add('barnroof', bx, bz, 7.0, 1.3, 5.6, '#7d2f2a', 4.2);
+  add('barndoor', bx - ax * 2.4, bz - az * 2.4, 1.9, 2.7, 1.9, '#e8d9bb');
+
+  // silo beside it, with a cap
+  const sx = ax * (half - 2.6) - px * 5.0;
+  const sz = az * (half - 2.6) - pz * 5.0;
+  add('silo', sx, sz, 2.6, 7.0, 2.6, '#ded3bd');
+  add('silocap', sx, sz, 2.9, 0.9, 2.9, '#9aa3ab', 7.0);
+
+  // windmill on the far side, blades as a simple cross
+  const wx = ax * (half - 2.2) + px * 8.8;
+  const wz = az * (half - 2.2) + pz * 8.8;
+  add('milltower', wx, wz, 1.5, 7.5, 1.5, '#f3e6c8');
+  add('millblade', wx, wz, 6.4, 0.32, 0.55, '#d8b26a', 7.2);
+  add('millblade', wx, wz, 0.55, 3.0, 0.32, '#d8b26a', 5.6);
+
+  // pond sits almost flush, trough and hay stand on the grass
+  add('pond', px * 8.0 - ax * 3.0, pz * 8.0 - az * 3.0, 5.4, 0.08, 4.0, '#5aa9d6');
+  add('trough', px * 5.4 + ax * 6.6, pz * 5.4 + az * 6.6, 2.4, 0.55, 1.0, '#9aa3ab');
+  // Haystacks are the only scenery scattered at random, so they are the only
+  // scenery that can wander into the walk-out lane. Four of six seeds put one
+  // there before this skip existed. Draw a new angle instead of nudging the
+  // radius: nudging would just make it graze the lane at a different distance.
+  for (let i = 0, tries = 0; i < 5 && tries < 60; tries++) {
+    const a = rnd() * Math.PI * 2;
+    const dxh = Math.cos(a), dzh = Math.sin(a);
+    if (dxh * towerDx + dzh * towerDz > 0.40) continue;
+    const r = 6.0 + rnd() * (half - 8.5);
+    add('haystack', dxh * r, dzh * r,
+      1.5 + rnd() * 0.6, 1.0 + rnd() * 0.4, 1.5 + rnd() * 0.6, '#e0b962');
+    i++;
+  }
+
+  // trees around the rim, skipping the wedge the tower climbs through
+  for (let i = 0; i < 14; i++) {
+    const a = (i / 14) * Math.PI * 2 + rnd() * 0.2;
+    const dx = Math.cos(a), dz = Math.sin(a);
+    if (dx * towerDx + dz * towerDz > 0.55) continue;   // keep the route clear
+    const r = half - 1.4 - rnd() * 1.6;
+    const tx = dx * r, tz = dz * r;
+    const th = 1.6 + rnd() * 0.9;
+    add('trunk', tx, tz, 0.5, th, 0.5, '#6b4a2f');
+    add('crown', tx, tz, 1.9 + rnd() * 0.7, 1.7 + rnd() * 0.6, 1.9 + rnd() * 0.7, '#4f9a52', th);
+  }
+
+  // fence posts + rails along the rim, same wedge skipped so you can walk out
+  const N = 30;
+  for (let i = 0; i < N; i++) {
+    const a = (i / N) * Math.PI * 2;
+    const dx = Math.cos(a), dz = Math.sin(a);
+    if (dx * towerDx + dz * towerDz > 0.62) continue;
+    const r = half - 0.6;
+    add('post', dx * r, dz * r, 0.2, 1.05, 0.2, '#efe7d6');
+    add('rail', dx * r, dz * r, Math.abs(dz) * 1.9 + 0.16, 0.13, Math.abs(dx) * 1.9 + 0.16, '#efe7d6', 0.62);
+  }
+  return items;
 }
 
 /**
@@ -234,7 +555,9 @@ function makeLevel(seed = DEFAULT_SEED, opts = {}) {
     angle += (rnd() - 0.5) * 1.7;
     const dx = Math.cos(angle);
     const dz = Math.sin(angle);
-    const dist = extentAlong(prev.w, prev.d, dx, dz) + extentAlong(w, d, dx, dz) + gapXZ;
+    // Edge to edge, in walkable units: `gapXZ` is now literally the distance the
+    // player must cross, not a number inflated by box diagonals.
+    const dist = rayExitXZ(prev.w, prev.d, dx, dz) + rayExitXZ(w, d, dx, dz) + gapXZ;
 
     platforms.push({
       i, kind, color: k[4],
@@ -247,9 +570,14 @@ function makeLevel(seed = DEFAULT_SEED, opts = {}) {
   }
 
   const top = platforms[platforms.length - 1];
+  // Direction the tower leaves the farmyard in, so decor can dodge it.
+  const p1 = platforms[1] || { x: 1, z: 0 };
+  const tl = Math.hypot(p1.x, p1.z) || 1;
+
   return {
     seed,
     platforms,
+    decor: makeDecor(rnd, p1.x / tl, p1.z / tl),
     spawn: { x: 0, y: 0, z: 0 },
     topY: top.y,
     topIndex: top.i,
@@ -382,20 +710,22 @@ function isFinitePlayer(s) {
  * END PURE CORE. Everything below is shell: rendering, input, HUD. No physics.
  * ==========================================================================*/
 
-var BUILD_VERSION = "1.0.0";
+var BUILD_VERSION = "2.0.0";
 
 // ---------------------------------------------------------------- state
 var level = makeLevel(DEFAULT_SEED);
 var player = makePlayer(level, "cow");
 var speciesId = "cow";
-var camYaw = 0.6, camPitch = 0.30, camDist = 9.2;
+var camYaw = 0.6, camPitch = CAM_PITCH_DEFAULT, camDist = CAM_DIST_DEFAULT;
+var pointerLocked = false;
 var keys = Object.create(null);
 var consoleErrors = [];
 var acc = 0, last = 0, tickCount = 0, fps = 0, fpsAcc = 0, fpsN = 0;
 
 var cv = document.getElementById("view");
 var ctx = cv.getContext("2d");
-var W = 0, H = 0, focal = 0, DPR = 1;
+var W = 0, H = 0, DPR = 1;
+var view = null;   // built once per frame by the pure core
 
 function resize() {
   DPR = Math.min(window.devicePixelRatio || 1, 2);
@@ -406,41 +736,22 @@ function resize() {
   cv.style.width = W + "px";
   cv.style.height = H + "px";
   ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
-  focal = (H / 2) / Math.tan(0.52);
 }
 window.addEventListener("resize", resize);
 resize();
 
-// ---------------------------------------------------------------- camera
-var camX = 0, camY = 0, camZ = 0;
+// The shell owns NO camera maths. makeView / projectPoint live in the pure core
+// so the fast gate can assert where things land on screen; v1.0 kept them here,
+// where nothing could test them, and shipped inverted pitch signs that threw the
+// animal 83px below the bottom edge. See docs/PITFALLS.md.
 function updateCamera() {
-  var tx = player.x, ty = player.y + 1.25, tz = player.z;
-  var cp = Math.cos(camPitch);
-  camX = tx - Math.sin(camYaw) * cp * camDist;
-  camY = ty + Math.sin(camPitch) * camDist;
-  camZ = tz - Math.cos(camYaw) * cp * camDist;
+  view = makeView(player.x, player.y, player.z, camYaw, camPitch, camDist, W, H);
 }
-// Rotate world so the camera's pitched forward axis becomes +Z. Derived, not
-// guessed: see docs/PITFALLS.md if you are tempted to "simplify" the signs.
 function toCam(px, py, pz, out) {
-  var dx = px - camX, dy = py - camY, dz = pz - camZ;
-  var cy = Math.cos(camYaw), sy = Math.sin(camYaw);
-  var x1 = dx * cy - dz * sy;
-  var z1 = dx * sy + dz * cy;
-  var cpp = Math.cos(camPitch), spp = Math.sin(camPitch);
-  out[0] = x1;
-  out[1] = dy * cpp - z1 * spp;
-  out[2] = dy * spp + z1 * cpp;
-  return out;
+  return toCameraSpace(px, py, pz, view.eye, view.yaw, view.pitch, out);
 }
-var _v = [0, 0, 0];
 function project(px, py, pz, out) {
-  toCam(px, py, pz, _v);
-  if (_v[2] < 0.12) return false;
-  out[0] = W / 2 + (_v[0] * focal) / _v[2];
-  out[1] = H / 2 - (_v[1] * focal) / _v[2];
-  out[2] = _v[2];
-  return true;
+  return projectPoint(px, py, pz, view, out);
 }
 
 // ---------------------------------------------------------------- colours
@@ -451,39 +762,27 @@ function shade(hex, f) {
   var b = Math.min(255, Math.round((n & 255) * f));
   return "rgb(" + r + "," + g + "," + b + ")";
 }
+// Blend toward the horizon colour so distance reads. t = 0 is untouched.
+function hazed(hex, f, t) {
+  var n = parseInt(hex.slice(1), 16);
+  var mix = function (c) { return Math.min(255, Math.round(c * f * (1 - t) + 196 * t)); };
+  return "rgb(" + mix((n >> 16) & 255) + "," + mix((n >> 8) & 255) + "," + mix(n & 255) + ")";
+}
 
 // ---------------------------------------------------------------- box drawing
-var CORNER = [[-1,0,-1],[1,0,-1],[1,0,1],[-1,0,1],[-1,-1,-1],[1,-1,-1],[1,-1,1],[-1,-1,1]];
-var FACES = [
-  { idx: [0,1,2,3], n: [0,1,0],  lit: 1.06 },
-  { idx: [3,2,6,7], n: [0,0,1],  lit: 0.80 },
-  { idx: [1,0,4,5], n: [0,0,-1], lit: 0.62 },
-  { idx: [2,1,5,6], n: [1,0,0],  lit: 0.90 },
-  { idx: [0,3,7,4], n: [-1,0,0], lit: 0.70 }
-];
-var pts = [];
-for (var pi = 0; pi < 8; pi++) pts.push([0,0,0]);
-
-function drawBox(x, y, z, w, h, d, color, alpha) {
-  var hw = w / 2, hd = d / 2, ok = true;
-  for (var i = 0; i < 8; i++) {
-    var c = CORNER[i];
-    if (!project(x + c[0]*hw, y + c[1]*h, z + c[2]*hd, pts[i])) { ok = false; break; }
-  }
-  if (!ok) return;
+// All geometry (corners, back-face culling, near-plane clipping, projection) is
+// in the pure core so the gate can assert what reaches the screen. The shell only
+// picks colours and fills paths.
+function drawBox(x, y, z, w, h, d, color, alpha, haze) {
+  var faces = boxScreenFaces(x, y, z, w, h, d, view);
+  if (faces.length === 0) return;
   ctx.globalAlpha = alpha === undefined ? 1 : alpha;
-  for (var f = 0; f < FACES.length; f++) {
-    var face = FACES[f], n = face.n, vis;
-    if (n[1] === 1) vis = camY > y;
-    else if (n[0] !== 0) vis = (camX - x) * n[0] > hw;
-    else vis = (camZ - z) * n[2] > hd;
-    if (!vis) continue;
-    ctx.fillStyle = shade(color, face.lit);
+  for (var f = 0; f < faces.length; f++) {
+    var pts = faces[f].pts;
+    ctx.fillStyle = haze ? hazed(color, faces[f].lit, haze) : shade(color, faces[f].lit);
     ctx.beginPath();
-    for (var k = 0; k < 4; k++) {
-      var p = pts[face.idx[k]];
-      if (k === 0) ctx.moveTo(p[0], p[1]); else ctx.lineTo(p[0], p[1]);
-    }
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for (var k = 1; k < pts.length; k++) ctx.lineTo(pts[k][0], pts[k][1]);
     ctx.closePath();
     ctx.fill();
   }
@@ -500,7 +799,7 @@ function drawSky() {
   ctx.fillStyle = g;
   ctx.fillRect(0, 0, W, H);
   // sun, parallaxed by yaw so turning the camera reads as turning
-  var sx = (W * 0.5) + Math.sin(camYaw - 2.1) * W * 0.62;
+  var sx = (W * 0.5) + Math.sin(view.yaw - 2.1) * W * 0.62;
   var sy = H * (0.20 + t * 0.1);
   var sg = ctx.createRadialGradient(sx, sy, 6, sx, sy, 120);
   sg.addColorStop(0, "rgba(255,247,214,.95)");
@@ -562,7 +861,7 @@ function drawShadow() {
   var c = [0,0,0];
   if (!project(player.x, bestP.y + 0.02, player.z, c)) return;
   var drop = player.y - bestP.y;
-  var rad = Math.max(3, (focal / c[2]) * 0.36);
+  var rad = Math.max(3, (view.focal / c[2]) * 0.36);
   ctx.globalAlpha = Math.max(0.08, 0.34 - drop * 0.02);
   ctx.fillStyle = "#14202b";
   ctx.beginPath(); ctx.ellipse(c[0], c[1], rad, rad * 0.45, 0, 0, 6.2832); ctx.fill();
@@ -571,25 +870,59 @@ function drawShadow() {
 
 // ---------------------------------------------------------------- frame
 var order = [];
+// The shell's own scratch vector. Do NOT reuse the core's `_v`: that only happens
+// to be reachable because the build inlines the core into this file, and it is the
+// same buffer projectPoint writes into. Borrowing it would work today and break
+// silently the moment anything projects between the write and the read.
+var _s = [0, 0, 0];
+function collect(list, isDecor) {
+  for (var i = 0; i < list.length; i++) {
+    var p = list[i];
+    if (Math.abs(p.y - player.y) > 62) continue;
+    toCam(p.x, p.y, p.z, _s);
+    if (_s[2] < 0.4 || _s[2] > 120) continue;
+    order.push([_s[2], p, isDecor]);
+  }
+}
 function render() {
   drawSky();
   order.length = 0;
-  for (var i = 0; i < level.platforms.length; i++) {
-    var p = level.platforms[i];
-    if (Math.abs(p.y - player.y) > 58) continue;
-    toCam(p.x, p.y, p.z, _v);
-    if (_v[2] < 0.4 || _v[2] > 105) continue;
-    order.push([_v[2], p]);
-  }
-  order.sort(function (a, b) { return b[0] - a[0]; });
+  collect(level.decor, true);
+  collect(level.platforms, false);
+  order.sort(function (a, b) { return b[0] - a[0]; });   // painter: far to near
   for (var j = 0; j < order.length; j++) {
-    var q = order[j][1];
-    drawBox(q.x, q.y, q.z, q.w, q.h, q.d, q.color, q.kind === "cloud" ? 0.9 : 1);
-    if (q.label) drawLabel(q);
+    var q = order[j][1], dec = order[j][2], z = order[j][0];
+    // Aerial haze on far geometry. Cheap, and it is what lets you read which of
+    // two overlapping platforms is nearer.
+    var haze = Math.min(0.55, Math.max(0, (z - 34) / 90));
+    drawBox(q.x, q.y, q.z, q.w, q.h, q.d, q.color, q.kind === "cloud" ? 0.9 : 1, haze);
+    if (!dec && q.label) drawLabel(q);
   }
+  drawNextMarker();
   drawShadow();
   drawAnimal();
 }
+
+// A soft beacon over the platform you are meant to reach next. Without it the
+// spiral hides the route behind you and the game reads as unfair rather than hard.
+function drawNextMarker() {
+  var n = level.platforms[Math.min(player.groundIdx + 1, level.platforms.length - 1)];
+  if (!n || n.i === player.groundIdx) return;
+  var pulse = 0.55 + 0.45 * Math.sin(player.t * 3.4);
+  var a = [0, 0, 0], b = [0, 0, 0];
+  if (!project(n.x, n.y + 0.05, n.z, a) || !project(n.x, n.y + 1.5, n.z, b)) return;
+  if (a[2] > 60) return;
+  var fade = Math.max(0, 1 - a[2] / 60);
+  ctx.globalAlpha = 0.30 * fade * pulse;
+  ctx.strokeStyle = "#fff8c4";
+  ctx.lineWidth = Math.max(2, 26 / a[2]);
+  ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke();
+  ctx.globalAlpha = 0.55 * fade * pulse;
+  var r = Math.max(4, (view.focal / a[2]) * (Math.min(n.w, n.d) * 0.42));
+  ctx.beginPath(); ctx.ellipse(a[0], a[1], r, r * 0.42, 0, 0, 6.2832); ctx.stroke();
+  ctx.globalAlpha = 1;
+}
+
 function drawLabel(p) {
   var c = [0,0,0];
   if (!project(p.x, p.y + 0.75, p.z, c)) return;
@@ -621,14 +954,51 @@ window.addEventListener("keydown", function (e) {
   if (n !== undefined) setSpecies(SPECIES[n].id);
 });
 window.addEventListener("keyup", function (e) { if (MAP[e.code]) keys[MAP[e.code]] = false; });
-var dragging = false, lastMX = 0;
-cv.addEventListener("mousedown", function (e) { dragging = true; lastMX = e.clientX; });
+// --- mouse look ---------------------------------------------------------------
+// Pointer Lock, because that is the only way a browser gives you continuous mouse
+// look: without it a page only sees the cursor while a button is held, which is
+// why v1.0 needed drag-to-turn. The lock request MUST come from a real user
+// gesture, so a click on the canvas arms it. Drag still works as a fallback for
+// anyone who does not want their cursor captured.
+var elLock = document.getElementById("lock");
+var dragging = false, lastMX = 0, lastMY = 0;
+
+function look(dxp, dyp) {
+  camYaw -= dxp * MOUSE_SENS_X;
+  camPitch = clampPitch(camPitch + dyp * MOUSE_SENS_Y);
+}
+function requestLock() {
+  if (pointerLocked) return;
+  try {
+    var r = cv.requestPointerLock && cv.requestPointerLock();
+    if (r && typeof r.catch === "function") r.catch(function () {});
+  } catch (e) { /* unsupported: drag-to-look still works */ }
+}
+document.addEventListener("pointerlockchange", function () {
+  pointerLocked = document.pointerLockElement === cv;
+  elLock.className = pointerLocked ? "panel hidden" : "panel";
+});
+document.addEventListener("pointerlockerror", function () {
+  pointerLocked = false;
+  elLock.className = "panel";
+});
+cv.addEventListener("click", requestLock);
+elLock.addEventListener("click", requestLock);
+
+cv.addEventListener("mousedown", function (e) {
+  if (!pointerLocked) { dragging = true; lastMX = e.clientX; lastMY = e.clientY; }
+});
 window.addEventListener("mouseup", function () { dragging = false; });
 window.addEventListener("mousemove", function (e) {
-  if (dragging) { camYaw -= (e.clientX - lastMX) * 0.006; lastMX = e.clientX; }
+  if (pointerLocked) {
+    look(e.movementX || 0, e.movementY || 0);
+  } else if (dragging) {
+    look(e.clientX - lastMX, e.clientY - lastMY);
+    lastMX = e.clientX; lastMY = e.clientY;
+  }
 });
 window.addEventListener("wheel", function (e) {
-  camDist = Math.max(5, Math.min(16, camDist + Math.sign(e.deltaY) * 0.6));
+  camDist = clampDist(camDist + Math.sign(e.deltaY) * 0.6);
 }, { passive: true });
 
 function resetRun() {
@@ -676,6 +1046,19 @@ function paintHUD() {
   }
 }
 
+// Tell the player what a mistake cost. A silent 12m drop reads as a glitch; a
+// number reads as the genre.
+var wasOnGround = true, takeoffY = 0;
+function reportFalls() {
+  if (player.onGround && !wasOnGround) {
+    var lost = takeoffY - player.y;
+    if (lost > 1.2) toast("掉了 " + lost.toFixed(1) + " m");
+  } else if (!player.onGround && wasOnGround) {
+    takeoffY = player.y;
+  }
+  wasOnGround = player.onGround;
+}
+
 // ---------------------------------------------------------------- loop
 function frame(now) {
   if (!last) last = now;
@@ -693,9 +1076,9 @@ function frame(now) {
     acc -= FIXED_DT; guard++; tickCount++;
   }
   if (acc > FIXED_DT * MAX_SUBSTEPS) acc = 0;
-  if (camPitch !== 0) { /* pitch is fixed in v1.0 */ }
   if (keys.q) camYaw -= 1.9 * dt;
   if (keys.e) camYaw += 1.9 * dt;
+  reportFalls();
   if (toastT > 0) { toastT -= dt; if (toastT <= 0) elToast.style.opacity = "0"; }
   updateCamera();
   render();
@@ -719,17 +1102,31 @@ window.__game = {
   get fps() { return fps; },
   get errors() { return consoleErrors.slice(); },
   get camYaw() { return camYaw; },
-  level: { seed: level.seed, count: level.platforms.length, topY: level.topY },
+  get camPitch() { return camPitch; },
+  get camDist() { return camDist; },
+  get pointerLocked() { return pointerLocked; },
+  level: {
+    seed: level.seed, count: level.platforms.length,
+    topY: level.topY, decorCount: level.decor.length,
+    groundW: level.platforms[0].w, groundD: level.platforms[0].d
+  },
   nav: function () {
     var i = player.groundIdx;
     var cur = level.platforms[i] || null;
     var nxt = level.platforms[Math.min(i + 1, level.platforms.length - 1)] || null;
     return {
-      idx: i, onGround: player.onGround, camYaw: camYaw,
+      idx: i, onGround: player.onGround, camYaw: camYaw, camPitch: camPitch,
       px: player.x, py: player.y, pz: player.z, bestY: player.bestY, falls: player.falls,
       cur: cur ? { x: cur.x, y: cur.y, z: cur.z, w: cur.w, d: cur.d } : null,
       next: nxt ? { x: nxt.x, y: nxt.y, z: nxt.z, w: nxt.w, d: nxt.d } : null
     };
+  },
+  // Where the animal's head projects to right now, in CSS pixels. The browser
+  // gate asserts this sits inside the viewport: that is the check v1.0 lacked.
+  aimPixel: function () {
+    var o = [0, 0, 0];
+    return projectPoint(view.target.x, view.target.y, view.target.z, view, o)
+      ? { x: o[0], y: o[1], z: o[2], w: W, h: H } : null;
   }
 };
 
