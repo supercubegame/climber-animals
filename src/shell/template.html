@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Climber Animals: Together — v1.0</title>
+<style>
+  html,body{margin:0;height:100%;overflow:hidden;background:#0d1b2a;
+    font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif;color:#fff;
+    -webkit-user-select:none;user-select:none;cursor:default}
+  #view{display:block;width:100vw;height:100vh}
+  .panel{position:fixed;background:rgba(18,32,45,.62);backdrop-filter:blur(6px);
+    border:1px solid rgba(255,255,255,.16);border-radius:14px;padding:12px 16px;
+    box-shadow:0 8px 28px rgba(0,0,0,.28)}
+  #hud{top:16px;left:16px;min-width:176px}
+  #hud .big{font-size:34px;font-weight:700;line-height:1.05;letter-spacing:-.5px}
+  #hud .big span{font-size:15px;font-weight:500;opacity:.65;margin-left:3px}
+  #hud .row{display:flex;justify-content:space-between;font-size:13px;opacity:.82;margin-top:5px}
+  #bar{height:7px;border-radius:4px;background:rgba(255,255,255,.16);margin-top:10px;overflow:hidden}
+  #barfill{height:100%;width:0%;border-radius:4px;
+    background:linear-gradient(90deg,#8fd66b,#ffd166,#ff8fab);transition:width .12s linear}
+  #picker{top:16px;right:16px;text-align:right}
+  #picker .t{font-size:11px;text-transform:uppercase;letter-spacing:1.4px;opacity:.6;margin-bottom:7px}
+  .sp{display:inline-block;padding:5px 11px;margin:2px;border-radius:9px;font-size:13px;
+    background:rgba(255,255,255,.1);border:1px solid transparent;cursor:pointer}
+  .sp.on{background:rgba(255,255,255,.92);color:#16232f;font-weight:700;border-color:#fff}
+  #keys{bottom:16px;left:16px;font-size:12.5px;line-height:1.75;opacity:.9;max-width:290px}
+  #keys b{display:inline-block;min-width:62px;font-family:Consolas,monospace;
+    background:rgba(255,255,255,.14);border-radius:5px;padding:0 6px;margin-right:8px;font-weight:600}
+  #banner{left:50%;top:34%;transform:translate(-50%,-50%);text-align:center;display:none;padding:24px 40px}
+  #banner .h{font-size:40px;font-weight:800;margin-bottom:6px}
+  #toast{left:50%;bottom:26px;transform:translateX(-50%);font-size:14px;
+    padding:8px 18px;opacity:0;transition:opacity .35s}
+</style>
+</head>
+<body>
+<canvas id="view"></canvas>
+
+<div id="hud" class="panel">
+  <div class="big"><span id="h-cur">0.0</span><span>m</span></div>
+  <div class="row"><span>最高</span><span><b id="h-best">0.0</b> m</span></div>
+  <div class="row"><span>掉落</span><span><b id="h-falls">0</b> 次</span></div>
+  <div class="row"><span>塔顶</span><span><b id="h-top">0</b> m</span></div>
+  <div id="bar"><div id="barfill"></div></div>
+</div>
+
+<div id="picker" class="panel">
+  <div class="t">Pick your climber</div>
+  <div id="splist"></div>
+</div>
+
+<div id="keys" class="panel">
+  <div><b>W A S D</b>移动</div>
+  <div><b>Space</b>跳（只有落地时能跳）</div>
+  <div><b>Q E</b>转视角 &nbsp;<b>拖鼠标</b>也行</div>
+  <div><b>1 2 3 4</b>换动物 &nbsp;<b>R</b>回农场重来</div>
+  <div style="opacity:.62;margin-top:6px">没有存档点。掉下去就得重爬。</div>
+</div>
+
+<div id="banner" class="panel">
+  <div class="h">🏆 登顶！</div>
+  <div id="bansub"></div>
+</div>
+<div id="toast" class="panel"></div>
+
+<script>
+"use strict";
+/* ============================================================================
+ * PURE CORE - inlined verbatim from src/core/ by tools/build.mjs.
+ * DO NOT EDIT BELOW THIS LINE. Edit src/core/*.mjs and run `node tools/build.mjs`.
+ * The fast gate rebuilds and byte-compares, so an edit here turns CI red.
+ * ==========================================================================*/
+/* @INLINE:CORE */
+/* ============================================================================
+ * END PURE CORE. Everything below is shell: rendering, input, HUD. No physics.
+ * ==========================================================================*/
+
+var BUILD_VERSION = "1.0.0";
+
+// ---------------------------------------------------------------- state
+var level = makeLevel(DEFAULT_SEED);
+var player = makePlayer(level, "cow");
+var speciesId = "cow";
+var camYaw = 0.6, camPitch = 0.30, camDist = 9.2;
+var keys = Object.create(null);
+var consoleErrors = [];
+var acc = 0, last = 0, tickCount = 0, fps = 0, fpsAcc = 0, fpsN = 0;
+
+var cv = document.getElementById("view");
+var ctx = cv.getContext("2d");
+var W = 0, H = 0, focal = 0, DPR = 1;
+
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = Math.max(320, window.innerWidth);
+  H = Math.max(240, window.innerHeight);
+  cv.width = Math.round(W * DPR);
+  cv.height = Math.round(H * DPR);
+  cv.style.width = W + "px";
+  cv.style.height = H + "px";
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  focal = (H / 2) / Math.tan(0.52);
+}
+window.addEventListener("resize", resize);
+resize();
+
+// ---------------------------------------------------------------- camera
+var camX = 0, camY = 0, camZ = 0;
+function updateCamera() {
+  var tx = player.x, ty = player.y + 1.25, tz = player.z;
+  var cp = Math.cos(camPitch);
+  camX = tx - Math.sin(camYaw) * cp * camDist;
+  camY = ty + Math.sin(camPitch) * camDist;
+  camZ = tz - Math.cos(camYaw) * cp * camDist;
+}
+// Rotate world so the camera's pitched forward axis becomes +Z. Derived, not
+// guessed: see docs/PITFALLS.md if you are tempted to "simplify" the signs.
+function toCam(px, py, pz, out) {
+  var dx = px - camX, dy = py - camY, dz = pz - camZ;
+  var cy = Math.cos(camYaw), sy = Math.sin(camYaw);
+  var x1 = dx * cy - dz * sy;
+  var z1 = dx * sy + dz * cy;
+  var cpp = Math.cos(camPitch), spp = Math.sin(camPitch);
+  out[0] = x1;
+  out[1] = dy * cpp - z1 * spp;
+  out[2] = dy * spp + z1 * cpp;
+  return out;
+}
+var _v = [0, 0, 0];
+function project(px, py, pz, out) {
+  toCam(px, py, pz, _v);
+  if (_v[2] < 0.12) return false;
+  out[0] = W / 2 + (_v[0] * focal) / _v[2];
+  out[1] = H / 2 - (_v[1] * focal) / _v[2];
+  out[2] = _v[2];
+  return true;
+}
+
+// ---------------------------------------------------------------- colours
+function shade(hex, f) {
+  var n = parseInt(hex.slice(1), 16);
+  var r = Math.min(255, Math.round(((n >> 16) & 255) * f));
+  var g = Math.min(255, Math.round(((n >> 8) & 255) * f));
+  var b = Math.min(255, Math.round((n & 255) * f));
+  return "rgb(" + r + "," + g + "," + b + ")";
+}
+
+// ---------------------------------------------------------------- box drawing
+var CORNER = [[-1,0,-1],[1,0,-1],[1,0,1],[-1,0,1],[-1,-1,-1],[1,-1,-1],[1,-1,1],[-1,-1,1]];
+var FACES = [
+  { idx: [0,1,2,3], n: [0,1,0],  lit: 1.06 },
+  { idx: [3,2,6,7], n: [0,0,1],  lit: 0.80 },
+  { idx: [1,0,4,5], n: [0,0,-1], lit: 0.62 },
+  { idx: [2,1,5,6], n: [1,0,0],  lit: 0.90 },
+  { idx: [0,3,7,4], n: [-1,0,0], lit: 0.70 }
+];
+var pts = [];
+for (var pi = 0; pi < 8; pi++) pts.push([0,0,0]);
+
+function drawBox(x, y, z, w, h, d, color, alpha) {
+  var hw = w / 2, hd = d / 2, ok = true;
+  for (var i = 0; i < 8; i++) {
+    var c = CORNER[i];
+    if (!project(x + c[0]*hw, y + c[1]*h, z + c[2]*hd, pts[i])) { ok = false; break; }
+  }
+  if (!ok) return;
+  ctx.globalAlpha = alpha === undefined ? 1 : alpha;
+  for (var f = 0; f < FACES.length; f++) {
+    var face = FACES[f], n = face.n, vis;
+    if (n[1] === 1) vis = camY > y;
+    else if (n[0] !== 0) vis = (camX - x) * n[0] > hw;
+    else vis = (camZ - z) * n[2] > hd;
+    if (!vis) continue;
+    ctx.fillStyle = shade(color, face.lit);
+    ctx.beginPath();
+    for (var k = 0; k < 4; k++) {
+      var p = pts[face.idx[k]];
+      if (k === 0) ctx.moveTo(p[0], p[1]); else ctx.lineTo(p[0], p[1]);
+    }
+    ctx.closePath();
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+// ---------------------------------------------------------------- sky
+function drawSky() {
+  var t = Math.max(0, Math.min(1, player.y / Math.max(1, level.topY)));
+  var g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, mixHex("#4a7fc1", "#241a48", t));
+  g.addColorStop(0.55, mixHex("#a8d3ef", "#5b4a8f", t));
+  g.addColorStop(1, mixHex("#e8f2d8", "#b98fb0", t));
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+  // sun, parallaxed by yaw so turning the camera reads as turning
+  var sx = (W * 0.5) + Math.sin(camYaw - 2.1) * W * 0.62;
+  var sy = H * (0.20 + t * 0.1);
+  var sg = ctx.createRadialGradient(sx, sy, 6, sx, sy, 120);
+  sg.addColorStop(0, "rgba(255,247,214,.95)");
+  sg.addColorStop(1, "rgba(255,247,214,0)");
+  ctx.fillStyle = sg;
+  ctx.fillRect(sx - 130, sy - 130, 260, 260);
+}
+function mixHex(a, b, t) {
+  var na = parseInt(a.slice(1), 16), nb = parseInt(b.slice(1), 16);
+  var r = Math.round(((na>>16)&255) * (1-t) + ((nb>>16)&255) * t);
+  var g = Math.round(((na>>8)&255) * (1-t) + ((nb>>8)&255) * t);
+  var c = Math.round((na&255) * (1-t) + (nb&255) * t);
+  return "rgb(" + r + "," + g + "," + c + ")";
+}
+
+// ---------------------------------------------------------------- animal
+function speciesDef(id) {
+  for (var i = 0; i < SPECIES.length; i++) if (SPECIES[i].id === id) return SPECIES[i];
+  return SPECIES[0];
+}
+function drawAnimal() {
+  var s = speciesDef(speciesId);
+  var x = player.x, y = player.y, z = player.z;
+  var bob = player.onGround ? Math.sin(player.t * 9) * 0.03 * Math.min(1, Math.hypot(player.vx, player.vz)) : 0;
+  var squash = player.onGround ? 1 : 1.1;
+  var by = y + 0.52 + bob;
+  drawBox(x, by, z, 0.70, 0.44 * squash, 0.52, s.body);            // body
+  drawBox(x, y + 0.16, z - 0.16, 0.60, 0.18, 0.20, s.spot);        // legs front
+  drawBox(x, y + 0.16, z + 0.16, 0.60, 0.18, 0.20, s.spot);        // legs back
+  drawBox(x, by + 0.42, z, 0.44, 0.36, 0.40, s.body);              // head
+  drawBox(x, by + 0.30, z + 0.16, 0.30, 0.16, 0.14, s.face);       // snout / beak
+  drawBox(x - 0.24, by + 0.50, z, 0.14, 0.14, 0.12, s.spot);       // ear L
+  drawBox(x + 0.24, by + 0.50, z, 0.14, 0.14, 0.12, s.spot);       // ear R
+  if (speciesId === "cow" || speciesId === "sheep") {
+    drawBox(x - 0.10, by + 0.02, z - 0.20, 0.22, 0.14, 0.10, s.spot);
+    drawBox(x + 0.16, by - 0.06, z + 0.18, 0.18, 0.12, 0.10, s.spot);
+  }
+  if (speciesId === "chicken") drawBox(x, by + 0.62, z, 0.10, 0.14, 0.20, s.face);
+  var e = [0,0,0];
+  if (project(x, by + 0.34, z + 0.19, e)) {
+    var r = Math.max(1.2, 26 / e[2]);
+    ctx.fillStyle = "#20191a";
+    ctx.beginPath(); ctx.arc(e[0] - r * 2.1, e[1], r, 0, 6.2832); ctx.fill();
+    ctx.beginPath(); ctx.arc(e[0] + r * 2.1, e[1], r, 0, 6.2832); ctx.fill();
+  }
+}
+
+// Landing shadow: the highest platform top strictly below the player. Purely
+// cosmetic, but it is what makes an air jump judgeable at all.
+function drawShadow() {
+  var bestP = null;
+  for (var i = 0; i < level.platforms.length; i++) {
+    var p = level.platforms[i];
+    if (p.y > player.y - 0.02) continue;
+    if (Math.abs(player.x - p.x) > p.w / 2 || Math.abs(player.z - p.z) > p.d / 2) continue;
+    if (!bestP || p.y > bestP.y) bestP = p;
+  }
+  if (!bestP) return;
+  var c = [0,0,0];
+  if (!project(player.x, bestP.y + 0.02, player.z, c)) return;
+  var drop = player.y - bestP.y;
+  var rad = Math.max(3, (focal / c[2]) * 0.36);
+  ctx.globalAlpha = Math.max(0.08, 0.34 - drop * 0.02);
+  ctx.fillStyle = "#14202b";
+  ctx.beginPath(); ctx.ellipse(c[0], c[1], rad, rad * 0.45, 0, 0, 6.2832); ctx.fill();
+  ctx.globalAlpha = 1;
+}
+
+// ---------------------------------------------------------------- frame
+var order = [];
+function render() {
+  drawSky();
+  order.length = 0;
+  for (var i = 0; i < level.platforms.length; i++) {
+    var p = level.platforms[i];
+    if (Math.abs(p.y - player.y) > 58) continue;
+    toCam(p.x, p.y, p.z, _v);
+    if (_v[2] < 0.4 || _v[2] > 105) continue;
+    order.push([_v[2], p]);
+  }
+  order.sort(function (a, b) { return b[0] - a[0]; });
+  for (var j = 0; j < order.length; j++) {
+    var q = order[j][1];
+    drawBox(q.x, q.y, q.z, q.w, q.h, q.d, q.color, q.kind === "cloud" ? 0.9 : 1);
+    if (q.label) drawLabel(q);
+  }
+  drawShadow();
+  drawAnimal();
+}
+function drawLabel(p) {
+  var c = [0,0,0];
+  if (!project(p.x, p.y + 0.75, p.z, c)) return;
+  if (c[2] > 46) return;
+  ctx.globalAlpha = Math.max(0, 1 - c[2] / 46);
+  ctx.font = "600 12px Consolas, monospace";
+  ctx.textAlign = "center";
+  ctx.fillStyle = "rgba(12,20,28,.55)";
+  var tw = ctx.measureText(p.label).width;
+  ctx.fillRect(c[0] - tw / 2 - 6, c[1] - 13, tw + 12, 18);
+  ctx.fillStyle = "#fff";
+  ctx.fillText(p.label, c[0], c[1]);
+  ctx.globalAlpha = 1;
+}
+
+// ---------------------------------------------------------------- input
+function currentInput() {
+  var f = (keys.w ? 1 : 0) - (keys.s ? 1 : 0);
+  var r = (keys.d ? 1 : 0) - (keys.a ? 1 : 0);
+  var sy = Math.sin(camYaw), cyw = Math.cos(camYaw);
+  return { mx: f * sy + r * cyw, mz: f * cyw - r * sy, jump: !!keys.space };
+}
+var MAP = { KeyW:"w", KeyA:"a", KeyS:"s", KeyD:"d", ArrowUp:"w", ArrowLeft:"a",
+  ArrowDown:"s", ArrowRight:"d", Space:"space", KeyQ:"q", KeyE:"e" };
+window.addEventListener("keydown", function (e) {
+  if (MAP[e.code]) { keys[MAP[e.code]] = true; e.preventDefault(); }
+  if (e.code === "KeyR") resetRun();
+  var n = { Digit1:0, Digit2:1, Digit3:2, Digit4:3 }[e.code];
+  if (n !== undefined) setSpecies(SPECIES[n].id);
+});
+window.addEventListener("keyup", function (e) { if (MAP[e.code]) keys[MAP[e.code]] = false; });
+var dragging = false, lastMX = 0;
+cv.addEventListener("mousedown", function (e) { dragging = true; lastMX = e.clientX; });
+window.addEventListener("mouseup", function () { dragging = false; });
+window.addEventListener("mousemove", function (e) {
+  if (dragging) { camYaw -= (e.clientX - lastMX) * 0.006; lastMX = e.clientX; }
+});
+window.addEventListener("wheel", function (e) {
+  camDist = Math.max(5, Math.min(16, camDist + Math.sign(e.deltaY) * 0.6));
+}, { passive: true });
+
+function resetRun() {
+  var best = player.bestY, falls = player.falls;
+  player = makePlayer(level, speciesId);
+  player.bestY = best; player.falls = falls;
+  toast("回到农场了，最高记录留着");
+}
+function setSpecies(id) {
+  speciesId = id;
+  player = Object.assign({}, player, { speciesId: id });
+  paintPicker();
+  toast("换成 " + speciesDef(id).name);
+}
+
+// ---------------------------------------------------------------- HUD
+var elCur = document.getElementById("h-cur"), elBest = document.getElementById("h-best");
+var elFalls = document.getElementById("h-falls"), elTop = document.getElementById("h-top");
+var elFill = document.getElementById("barfill"), elBanner = document.getElementById("banner");
+var elBanSub = document.getElementById("bansub"), elToast = document.getElementById("toast");
+elTop.textContent = level.topY.toFixed(0);
+var toastT = 0;
+function toast(msg) { elToast.textContent = msg; elToast.style.opacity = "1"; toastT = 1.9; }
+function paintPicker() {
+  var h = "";
+  for (var i = 0; i < SPECIES.length; i++) {
+    h += '<span class="sp' + (SPECIES[i].id === speciesId ? " on" : "") + '" data-id="' +
+      SPECIES[i].id + '">' + (i + 1) + " " + SPECIES[i].name + "</span>";
+  }
+  document.getElementById("splist").innerHTML = h;
+}
+document.getElementById("splist").addEventListener("click", function (e) {
+  var id = e.target && e.target.getAttribute && e.target.getAttribute("data-id");
+  if (id) setSpecies(id);
+});
+paintPicker();
+function paintHUD() {
+  elCur.textContent = player.y.toFixed(1);
+  elBest.textContent = player.bestY.toFixed(1);
+  elFalls.textContent = String(player.falls);
+  elFill.style.width = Math.max(0, Math.min(100, (player.bestY / level.topY) * 100)).toFixed(1) + "%";
+  if (player.won && elBanner.style.display !== "block") {
+    elBanner.style.display = "block";
+    elBanSub.textContent = "用了 " + player.t.toFixed(0) + " 秒，掉了 " + player.falls + " 次";
+  }
+}
+
+// ---------------------------------------------------------------- loop
+function frame(now) {
+  if (!last) last = now;
+  var dt = (now - last) / 1000;
+  last = now;
+  // A backgrounded tab throttles rAF; without this clamp the first frame back
+  // would teleport the animal through the tower.
+  if (dt > MAX_SUBSTEPS * FIXED_DT) dt = MAX_SUBSTEPS * FIXED_DT;
+  if (dt > 0) { fpsAcc += dt; fpsN++; if (fpsAcc > 0.5) { fps = fpsN / fpsAcc; fpsAcc = 0; fpsN = 0; } }
+  acc += dt;
+  var guard = 0;
+  var input = currentInput();
+  while (acc >= FIXED_DT && guard < MAX_SUBSTEPS) {
+    player = stepPlayer(player, input, level);
+    acc -= FIXED_DT; guard++; tickCount++;
+  }
+  if (acc > FIXED_DT * MAX_SUBSTEPS) acc = 0;
+  if (camPitch !== 0) { /* pitch is fixed in v1.0 */ }
+  if (keys.q) camYaw -= 1.9 * dt;
+  if (keys.e) camYaw += 1.9 * dt;
+  if (toastT > 0) { toastT -= dt; if (toastT <= 0) elToast.style.opacity = "0"; }
+  updateCamera();
+  render();
+  paintHUD();
+  requestAnimationFrame(frame);
+}
+window.addEventListener("error", function (e) { consoleErrors.push(String(e.message)); });
+
+// Read-only handle for tools/verify-browser.mjs. The browser gate drives the
+// game through REAL KeyboardEvents and only reads state through here, so the
+// input path is under test rather than mocked out.
+//
+// nav() hands out RAW NUMBERS ONLY. The steering maths lives in the gate, not in
+// here: a helper that computed "which way should I go" inside the page would be
+// shipped code that only the test uses, and the test would then be grading the
+// helper instead of the game.
+window.__game = {
+  version: BUILD_VERSION,
+  get state() { return player; },
+  get ticks() { return tickCount; },
+  get fps() { return fps; },
+  get errors() { return consoleErrors.slice(); },
+  get camYaw() { return camYaw; },
+  level: { seed: level.seed, count: level.platforms.length, topY: level.topY },
+  nav: function () {
+    var i = player.groundIdx;
+    var cur = level.platforms[i] || null;
+    var nxt = level.platforms[Math.min(i + 1, level.platforms.length - 1)] || null;
+    return {
+      idx: i, onGround: player.onGround, camYaw: camYaw,
+      px: player.x, py: player.y, pz: player.z, bestY: player.bestY, falls: player.falls,
+      cur: cur ? { x: cur.x, y: cur.y, z: cur.z, w: cur.w, d: cur.d } : null,
+      next: nxt ? { x: nxt.x, y: nxt.y, z: nxt.z, w: nxt.w, d: nxt.d } : null
+    };
+  }
+};
+
+updateCamera();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

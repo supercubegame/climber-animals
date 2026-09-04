@@ -1,0 +1,196 @@
+name: gate
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # The browser gate depends on an external toolchain (puppeteer + Chromium).
+    # That drifts on days when nobody pushes, so it also runs on a clock.
+    - cron: '17 3 * * *'
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: gate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fast:
+    name: fast gate (pure core)
+    runs-on: ubuntu-latest
+    outputs:
+      result: ${{ steps.gate.outcome }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      # continue-on-error so the report still gets written; the report job is
+      # what turns the run red. A silent gate is worse than a red one.
+      - id: gate
+        continue-on-error: true
+        run: node tools/verify.mjs --log=fast-gate.log
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-fast
+          path: fast-gate.log
+          if-no-files-found: warn
+
+  browser:
+    name: slow gate (headless Chromium)
+    runs-on: ubuntu-latest
+    outputs:
+      result: ${{ steps.gate.outcome }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - name: install puppeteer
+        run: npm i --no-audit --no-fund --no-save puppeteer@23
+      - id: gate
+        continue-on-error: true
+        run: node tools/verify-browser.mjs --log=browser-gate.log
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-browser
+          path: |
+            browser-gate.log
+            shots/*.png
+          if-no-files-found: warn
+
+  report:
+    name: write results back
+    needs: [fast, browser]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with: { path: logs, merge-multiple: true }
+      - uses: actions/github-script@v7
+        env:
+          FAST: ${{ needs.fast.outputs.result }}
+          BROWSER: ${{ needs.browser.outputs.result }}
+        with:
+          script: |
+            const fs = require('fs');
+            // MARKER: identical string in the report and the attest job. Changing
+            // one and not the other means dedupe stops working AND attest stops
+            // finding anything, i.e. a silent read failure.
+            const MARKER = '<!-- climber-animals-gate -->';
+            const sha = context.sha;
+            const short = sha.slice(0, 7);
+            const runId = context.runId;
+            const fast = process.env.FAST || 'unknown';
+            const browser = process.env.BROWSER || 'unknown';
+            const icon = (s) => (s === 'success' ? '✅' : s === 'skipped' ? '⏭️' : '❌');
+
+            const grab = (f) => {
+              try { return fs.readFileSync('logs/' + f, 'utf8'); } catch { return ''; }
+            };
+            const fastLog = grab('fast-gate.log');
+            const browserLog = grab('browser-gate.log');
+            const failing = (t) => t.split('\n').filter((l) => l.startsWith('[FAIL]'));
+            const tail = (t, n) => t.split('\n').slice(-n).join('\n');
+
+            let body = `${MARKER}\n### gate · \`${short}\` · run [${runId}](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${runId})\n\n`;
+            body += `| gate | result |\n|---|---|\n`;
+            body += `| fast (pure core) | ${icon(fast)} ${fast} |\n| slow (headless Chromium) | ${icon(browser)} ${browser} |\n\n`;
+
+            const fails = [...failing(fastLog), ...failing(browserLog)];
+            if (fails.length) {
+              body += `**${fails.length} failing check(s)** — reason travels with the report, the raw CI log is not readable from the agent side:\n\n`;
+              body += '```\n' + fails.join('\n').slice(0, 5000) + '\n```\n\n';
+            }
+            for (const [name, text] of [['fast', fastLog], ['browser', browserLog]]) {
+              if (!text) { body += `_no ${name} log artifact reached this job — treat this run as NOT VERIFIED, not as healthy._\n\n`; continue; }
+              body += `<details><summary>${name} gate log</summary>\n\n\`\`\`\n${tail(text, 70).slice(0, 12000)}\n\`\`\`\n\n</details>\n\n`;
+            }
+
+            const { owner, repo } = context.repo;
+            const upsert = async (list, create, update) => {
+              const existing = list.find((c) => c.body && c.body.includes(MARKER));
+              if (existing) await update(existing.id); else await create();
+            };
+
+            // channel 1: pull request (if this sha belongs to one)
+            let prNumber = context.payload.pull_request && context.payload.pull_request.number;
+            if (!prNumber) {
+              const { data } = await github.rest.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: sha });
+              if (data.length) prNumber = data[0].number;
+            }
+            if (prNumber) {
+              const { data: comments } = await github.rest.issues.listComments({ owner, repo, issue_number: prNumber, per_page: 100 });
+              await upsert(comments,
+                () => github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body }),
+                (id) => github.rest.issues.updateComment({ owner, repo, comment_id: id, body }));
+              core.info('wrote PR comment on #' + prNumber);
+            }
+
+            // channel 2: commit comment. Must exist on every run, PR or not, or a
+            // failure on the default branch would be invisible. Dedupe lives here
+            // too: without it a re-run of the same sha silently doubles up.
+            const { data: cc } = await github.rest.repos.listCommentsForCommit({ owner, repo, commit_sha: sha, per_page: 100 });
+            await upsert(cc,
+              () => github.rest.repos.createCommitComment({ owner, repo, commit_sha: sha, body }),
+              (id) => github.rest.repos.updateCommitComment({ owner, repo, comment_id: id, body }));
+            core.info('wrote commit comment on ' + short);
+
+            if (fast !== 'success' || browser !== 'success') {
+              core.setFailed(`gate failed (fast=${fast}, browser=${browser}) — see the comment on ${short}`);
+            }
+
+  attest:
+    name: confirm the report actually landed
+    needs: report
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const MARKER = '<!-- climber-animals-gate -->';
+            const { owner, repo } = context.repo;
+            const sha = context.sha;
+            const runId = String(context.runId);
+
+            // Pinned to THIS run: "a comment with the marker exists" is the classic
+            // idempotent-write false green, it stays true forever after run #1.
+            const matches = (c) => c.body && c.body.includes(MARKER) && c.body.includes(runId);
+
+            const findCommit = async (marker) => {
+              const { data } = await github.rest.repos.listCommentsForCommit({ owner, repo, commit_sha: sha, per_page: 100 });
+              return data.filter((c) => c.body && c.body.includes(marker) && c.body.includes(runId)).length;
+            };
+
+            // Self-test: the same finder must return 0 for a marker that cannot exist.
+            const impossible = await findCommit('<!-- marker-that-cannot-exist-' + runId + ' -->');
+            if (impossible !== 0) core.setFailed(`finder returned ${impossible} for an impossible marker — it is not actually reading anything`);
+
+            let prNumber = context.payload.pull_request && context.payload.pull_request.number;
+            if (!prNumber) {
+              const { data } = await github.rest.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: sha });
+              if (data.length) prNumber = data[0].number;
+            }
+
+            let commitFound = 0, prFound = 0;
+            for (let attempt = 1; attempt <= 6; attempt++) {
+              commitFound = await findCommit(MARKER);
+              if (prNumber) {
+                const { data } = await github.rest.issues.listComments({ owner, repo, issue_number: prNumber, per_page: 100 });
+                prFound = data.filter(matches).length;
+              }
+              if (commitFound > 0 && (!prNumber || prFound > 0)) break;
+              await new Promise((r) => setTimeout(r, 5000));   // poll, do not sleep once and hope
+            }
+
+            core.info(`attempt summary: commit=${commitFound} pr=${prFound} prNumber=${prNumber || 'none'}`);
+            if (commitFound === 0) core.setFailed('no commit comment for this run — the gate result was never delivered, so this run verified nothing readable');
+            if (prNumber && prFound === 0) core.setFailed(`no PR comment on #${prNumber} for this run — the PR channel is broken even though the commit channel worked`);
+            if (commitFound > 1) core.setFailed(`${commitFound} commit comments for one run — dedupe is broken and the log will drown in duplicates`);
