@@ -1,0 +1,12 @@
+{
+  "name": "climber-animals",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cute farm-themed Only Up style 3D vertical climber. One HTML file, double-click to play.",
+  "scripts": {
+    "build": "node tools/build.mjs",
+    "verify": "node tools/build.mjs --check && node tools/verify.mjs",
+    "verify:browser": "node tools/verify-browser.mjs",
+    "gate": "npm run verify && npm run verify:browser"
+  }
+}
