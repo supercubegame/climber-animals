@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Climber Animals: Together — v1.0</title>
+<title>Climber Animals: Together — v2.0</title>
 <style>
   html,body{margin:0;height:100%;overflow:hidden;background:#0d1b2a;
     font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif;color:#fff;
@@ -31,6 +31,9 @@
   #banner .h{font-size:40px;font-weight:800;margin-bottom:6px}
   #toast{left:50%;bottom:26px;transform:translateX(-50%);font-size:14px;
     padding:8px 18px;opacity:0;transition:opacity .35s}
+  #lock{left:50%;top:50%;transform:translate(-50%,-50%);text-align:center;
+    padding:16px 26px;cursor:pointer;transition:opacity .25s}
+  #lock.hidden{opacity:0;pointer-events:none}
 </style>
 </head>
 <body>
@@ -50,11 +53,17 @@
 </div>
 
 <div id="keys" class="panel">
-  <div><b>W A S D</b>移动</div>
+  <div><b>W A S D</b>移动（跟着镜头方向）</div>
   <div><b>Space</b>跳（只有落地时能跳）</div>
-  <div><b>Q E</b>转视角 &nbsp;<b>拖鼠标</b>也行</div>
+  <div><b>移动鼠标</b>转视角（点一下画面先锁定）</div>
+  <div><b>Q E</b>左右转 &nbsp;<b>滚轮</b>拉远拉近</div>
   <div><b>1 2 3 4</b>换动物 &nbsp;<b>R</b>回农场重来</div>
   <div style="opacity:.62;margin-top:6px">没有存档点。掉下去就得重爬。</div>
+</div>
+
+<div id="lock" class="panel">
+  <div style="font-size:15px;font-weight:700;margin-bottom:2px">点一下画面，鼠标就能直接转视角</div>
+  <div style="opacity:.7;font-size:12.5px">锁定后移动鼠标即可环视，按 Esc 解除</div>
 </div>
 
 <div id="banner" class="panel">
@@ -75,20 +84,22 @@
  * END PURE CORE. Everything below is shell: rendering, input, HUD. No physics.
  * ==========================================================================*/
 
-var BUILD_VERSION = "1.0.0";
+var BUILD_VERSION = "2.0.0";
 
 // ---------------------------------------------------------------- state
 var level = makeLevel(DEFAULT_SEED);
 var player = makePlayer(level, "cow");
 var speciesId = "cow";
-var camYaw = 0.6, camPitch = 0.30, camDist = 9.2;
+var camYaw = 0.6, camPitch = CAM_PITCH_DEFAULT, camDist = CAM_DIST_DEFAULT;
+var pointerLocked = false;
 var keys = Object.create(null);
 var consoleErrors = [];
 var acc = 0, last = 0, tickCount = 0, fps = 0, fpsAcc = 0, fpsN = 0;
 
 var cv = document.getElementById("view");
 var ctx = cv.getContext("2d");
-var W = 0, H = 0, focal = 0, DPR = 1;
+var W = 0, H = 0, DPR = 1;
+var view = null;   // built once per frame by the pure core
 
 function resize() {
   DPR = Math.min(window.devicePixelRatio || 1, 2);
@@ -99,41 +110,22 @@ function resize() {
   cv.style.width = W + "px";
   cv.style.height = H + "px";
   ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
-  focal = (H / 2) / Math.tan(0.52);
 }
 window.addEventListener("resize", resize);
 resize();
 
-// ---------------------------------------------------------------- camera
-var camX = 0, camY = 0, camZ = 0;
+// The shell owns NO camera maths. makeView / projectPoint live in the pure core
+// so the fast gate can assert where things land on screen; v1.0 kept them here,
+// where nothing could test them, and shipped inverted pitch signs that threw the
+// animal 83px below the bottom edge. See docs/PITFALLS.md.
 function updateCamera() {
-  var tx = player.x, ty = player.y + 1.25, tz = player.z;
-  var cp = Math.cos(camPitch);
-  camX = tx - Math.sin(camYaw) * cp * camDist;
-  camY = ty + Math.sin(camPitch) * camDist;
-  camZ = tz - Math.cos(camYaw) * cp * camDist;
+  view = makeView(player.x, player.y, player.z, camYaw, camPitch, camDist, W, H);
 }
-// Rotate world so the camera's pitched forward axis becomes +Z. Derived, not
-// guessed: see docs/PITFALLS.md if you are tempted to "simplify" the signs.
 function toCam(px, py, pz, out) {
-  var dx = px - camX, dy = py - camY, dz = pz - camZ;
-  var cy = Math.cos(camYaw), sy = Math.sin(camYaw);
-  var x1 = dx * cy - dz * sy;
-  var z1 = dx * sy + dz * cy;
-  var cpp = Math.cos(camPitch), spp = Math.sin(camPitch);
-  out[0] = x1;
-  out[1] = dy * cpp - z1 * spp;
-  out[2] = dy * spp + z1 * cpp;
-  return out;
+  return toCameraSpace(px, py, pz, view.eye, view.yaw, view.pitch, out);
 }
-var _v = [0, 0, 0];
 function project(px, py, pz, out) {
-  toCam(px, py, pz, _v);
-  if (_v[2] < 0.12) return false;
-  out[0] = W / 2 + (_v[0] * focal) / _v[2];
-  out[1] = H / 2 - (_v[1] * focal) / _v[2];
-  out[2] = _v[2];
-  return true;
+  return projectPoint(px, py, pz, view, out);
 }
 
 // ---------------------------------------------------------------- colours
@@ -144,39 +136,27 @@ function shade(hex, f) {
   var b = Math.min(255, Math.round((n & 255) * f));
   return "rgb(" + r + "," + g + "," + b + ")";
 }
+// Blend toward the horizon colour so distance reads. t = 0 is untouched.
+function hazed(hex, f, t) {
+  var n = parseInt(hex.slice(1), 16);
+  var mix = function (c) { return Math.min(255, Math.round(c * f * (1 - t) + 196 * t)); };
+  return "rgb(" + mix((n >> 16) & 255) + "," + mix((n >> 8) & 255) + "," + mix(n & 255) + ")";
+}
 
 // ---------------------------------------------------------------- box drawing
-var CORNER = [[-1,0,-1],[1,0,-1],[1,0,1],[-1,0,1],[-1,-1,-1],[1,-1,-1],[1,-1,1],[-1,-1,1]];
-var FACES = [
-  { idx: [0,1,2,3], n: [0,1,0],  lit: 1.06 },
-  { idx: [3,2,6,7], n: [0,0,1],  lit: 0.80 },
-  { idx: [1,0,4,5], n: [0,0,-1], lit: 0.62 },
-  { idx: [2,1,5,6], n: [1,0,0],  lit: 0.90 },
-  { idx: [0,3,7,4], n: [-1,0,0], lit: 0.70 }
-];
-var pts = [];
-for (var pi = 0; pi < 8; pi++) pts.push([0,0,0]);
-
-function drawBox(x, y, z, w, h, d, color, alpha) {
-  var hw = w / 2, hd = d / 2, ok = true;
-  for (var i = 0; i < 8; i++) {
-    var c = CORNER[i];
-    if (!project(x + c[0]*hw, y + c[1]*h, z + c[2]*hd, pts[i])) { ok = false; break; }
-  }
-  if (!ok) return;
+// All geometry (corners, back-face culling, near-plane clipping, projection) is
+// in the pure core so the gate can assert what reaches the screen. The shell only
+// picks colours and fills paths.
+function drawBox(x, y, z, w, h, d, color, alpha, haze) {
+  var faces = boxScreenFaces(x, y, z, w, h, d, view);
+  if (faces.length === 0) return;
   ctx.globalAlpha = alpha === undefined ? 1 : alpha;
-  for (var f = 0; f < FACES.length; f++) {
-    var face = FACES[f], n = face.n, vis;
-    if (n[1] === 1) vis = camY > y;
-    else if (n[0] !== 0) vis = (camX - x) * n[0] > hw;
-    else vis = (camZ - z) * n[2] > hd;
-    if (!vis) continue;
-    ctx.fillStyle = shade(color, face.lit);
+  for (var f = 0; f < faces.length; f++) {
+    var pts = faces[f].pts;
+    ctx.fillStyle = haze ? hazed(color, faces[f].lit, haze) : shade(color, faces[f].lit);
     ctx.beginPath();
-    for (var k = 0; k < 4; k++) {
-      var p = pts[face.idx[k]];
-      if (k === 0) ctx.moveTo(p[0], p[1]); else ctx.lineTo(p[0], p[1]);
-    }
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    for (var k = 1; k < pts.length; k++) ctx.lineTo(pts[k][0], pts[k][1]);
     ctx.closePath();
     ctx.fill();
   }
@@ -193,7 +173,7 @@ function drawSky() {
   ctx.fillStyle = g;
   ctx.fillRect(0, 0, W, H);
   // sun, parallaxed by yaw so turning the camera reads as turning
-  var sx = (W * 0.5) + Math.sin(camYaw - 2.1) * W * 0.62;
+  var sx = (W * 0.5) + Math.sin(view.yaw - 2.1) * W * 0.62;
   var sy = H * (0.20 + t * 0.1);
   var sg = ctx.createRadialGradient(sx, sy, 6, sx, sy, 120);
   sg.addColorStop(0, "rgba(255,247,214,.95)");
@@ -255,7 +235,7 @@ function drawShadow() {
   var c = [0,0,0];
   if (!project(player.x, bestP.y + 0.02, player.z, c)) return;
   var drop = player.y - bestP.y;
-  var rad = Math.max(3, (focal / c[2]) * 0.36);
+  var rad = Math.max(3, (view.focal / c[2]) * 0.36);
   ctx.globalAlpha = Math.max(0.08, 0.34 - drop * 0.02);
   ctx.fillStyle = "#14202b";
   ctx.beginPath(); ctx.ellipse(c[0], c[1], rad, rad * 0.45, 0, 0, 6.2832); ctx.fill();
@@ -264,25 +244,59 @@ function drawShadow() {
 
 // ---------------------------------------------------------------- frame
 var order = [];
+// The shell's own scratch vector. Do NOT reuse the core's `_v`: that only happens
+// to be reachable because the build inlines the core into this file, and it is the
+// same buffer projectPoint writes into. Borrowing it would work today and break
+// silently the moment anything projects between the write and the read.
+var _s = [0, 0, 0];
+function collect(list, isDecor) {
+  for (var i = 0; i < list.length; i++) {
+    var p = list[i];
+    if (Math.abs(p.y - player.y) > 62) continue;
+    toCam(p.x, p.y, p.z, _s);
+    if (_s[2] < 0.4 || _s[2] > 120) continue;
+    order.push([_s[2], p, isDecor]);
+  }
+}
 function render() {
   drawSky();
   order.length = 0;
-  for (var i = 0; i < level.platforms.length; i++) {
-    var p = level.platforms[i];
-    if (Math.abs(p.y - player.y) > 58) continue;
-    toCam(p.x, p.y, p.z, _v);
-    if (_v[2] < 0.4 || _v[2] > 105) continue;
-    order.push([_v[2], p]);
-  }
-  order.sort(function (a, b) { return b[0] - a[0]; });
+  collect(level.decor, true);
+  collect(level.platforms, false);
+  order.sort(function (a, b) { return b[0] - a[0]; });   // painter: far to near
   for (var j = 0; j < order.length; j++) {
-    var q = order[j][1];
-    drawBox(q.x, q.y, q.z, q.w, q.h, q.d, q.color, q.kind === "cloud" ? 0.9 : 1);
-    if (q.label) drawLabel(q);
+    var q = order[j][1], dec = order[j][2], z = order[j][0];
+    // Aerial haze on far geometry. Cheap, and it is what lets you read which of
+    // two overlapping platforms is nearer.
+    var haze = Math.min(0.55, Math.max(0, (z - 34) / 90));
+    drawBox(q.x, q.y, q.z, q.w, q.h, q.d, q.color, q.kind === "cloud" ? 0.9 : 1, haze);
+    if (!dec && q.label) drawLabel(q);
   }
+  drawNextMarker();
   drawShadow();
   drawAnimal();
 }
+
+// A soft beacon over the platform you are meant to reach next. Without it the
+// spiral hides the route behind you and the game reads as unfair rather than hard.
+function drawNextMarker() {
+  var n = level.platforms[Math.min(player.groundIdx + 1, level.platforms.length - 1)];
+  if (!n || n.i === player.groundIdx) return;
+  var pulse = 0.55 + 0.45 * Math.sin(player.t * 3.4);
+  var a = [0, 0, 0], b = [0, 0, 0];
+  if (!project(n.x, n.y + 0.05, n.z, a) || !project(n.x, n.y + 1.5, n.z, b)) return;
+  if (a[2] > 60) return;
+  var fade = Math.max(0, 1 - a[2] / 60);
+  ctx.globalAlpha = 0.30 * fade * pulse;
+  ctx.strokeStyle = "#fff8c4";
+  ctx.lineWidth = Math.max(2, 26 / a[2]);
+  ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke();
+  ctx.globalAlpha = 0.55 * fade * pulse;
+  var r = Math.max(4, (view.focal / a[2]) * (Math.min(n.w, n.d) * 0.42));
+  ctx.beginPath(); ctx.ellipse(a[0], a[1], r, r * 0.42, 0, 0, 6.2832); ctx.stroke();
+  ctx.globalAlpha = 1;
+}
+
 function drawLabel(p) {
   var c = [0,0,0];
   if (!project(p.x, p.y + 0.75, p.z, c)) return;
@@ -314,14 +328,51 @@ window.addEventListener("keydown", function (e) {
   if (n !== undefined) setSpecies(SPECIES[n].id);
 });
 window.addEventListener("keyup", function (e) { if (MAP[e.code]) keys[MAP[e.code]] = false; });
-var dragging = false, lastMX = 0;
-cv.addEventListener("mousedown", function (e) { dragging = true; lastMX = e.clientX; });
+// --- mouse look ---------------------------------------------------------------
+// Pointer Lock, because that is the only way a browser gives you continuous mouse
+// look: without it a page only sees the cursor while a button is held, which is
+// why v1.0 needed drag-to-turn. The lock request MUST come from a real user
+// gesture, so a click on the canvas arms it. Drag still works as a fallback for
+// anyone who does not want their cursor captured.
+var elLock = document.getElementById("lock");
+var dragging = false, lastMX = 0, lastMY = 0;
+
+function look(dxp, dyp) {
+  camYaw -= dxp * MOUSE_SENS_X;
+  camPitch = clampPitch(camPitch + dyp * MOUSE_SENS_Y);
+}
+function requestLock() {
+  if (pointerLocked) return;
+  try {
+    var r = cv.requestPointerLock && cv.requestPointerLock();
+    if (r && typeof r.catch === "function") r.catch(function () {});
+  } catch (e) { /* unsupported: drag-to-look still works */ }
+}
+document.addEventListener("pointerlockchange", function () {
+  pointerLocked = document.pointerLockElement === cv;
+  elLock.className = pointerLocked ? "panel hidden" : "panel";
+});
+document.addEventListener("pointerlockerror", function () {
+  pointerLocked = false;
+  elLock.className = "panel";
+});
+cv.addEventListener("click", requestLock);
+elLock.addEventListener("click", requestLock);
+
+cv.addEventListener("mousedown", function (e) {
+  if (!pointerLocked) { dragging = true; lastMX = e.clientX; lastMY = e.clientY; }
+});
 window.addEventListener("mouseup", function () { dragging = false; });
 window.addEventListener("mousemove", function (e) {
-  if (dragging) { camYaw -= (e.clientX - lastMX) * 0.006; lastMX = e.clientX; }
+  if (pointerLocked) {
+    look(e.movementX || 0, e.movementY || 0);
+  } else if (dragging) {
+    look(e.clientX - lastMX, e.clientY - lastMY);
+    lastMX = e.clientX; lastMY = e.clientY;
+  }
 });
 window.addEventListener("wheel", function (e) {
-  camDist = Math.max(5, Math.min(16, camDist + Math.sign(e.deltaY) * 0.6));
+  camDist = clampDist(camDist + Math.sign(e.deltaY) * 0.6);
 }, { passive: true });
 
 function resetRun() {
@@ -369,6 +420,19 @@ function paintHUD() {
   }
 }
 
+// Tell the player what a mistake cost. A silent 12m drop reads as a glitch; a
+// number reads as the genre.
+var wasOnGround = true, takeoffY = 0;
+function reportFalls() {
+  if (player.onGround && !wasOnGround) {
+    var lost = takeoffY - player.y;
+    if (lost > 1.2) toast("掉了 " + lost.toFixed(1) + " m");
+  } else if (!player.onGround && wasOnGround) {
+    takeoffY = player.y;
+  }
+  wasOnGround = player.onGround;
+}
+
 // ---------------------------------------------------------------- loop
 function frame(now) {
   if (!last) last = now;
@@ -386,9 +450,9 @@ function frame(now) {
     acc -= FIXED_DT; guard++; tickCount++;
   }
   if (acc > FIXED_DT * MAX_SUBSTEPS) acc = 0;
-  if (camPitch !== 0) { /* pitch is fixed in v1.0 */ }
   if (keys.q) camYaw -= 1.9 * dt;
   if (keys.e) camYaw += 1.9 * dt;
+  reportFalls();
   if (toastT > 0) { toastT -= dt; if (toastT <= 0) elToast.style.opacity = "0"; }
   updateCamera();
   render();
@@ -412,17 +476,31 @@ window.__game = {
   get fps() { return fps; },
   get errors() { return consoleErrors.slice(); },
   get camYaw() { return camYaw; },
-  level: { seed: level.seed, count: level.platforms.length, topY: level.topY },
+  get camPitch() { return camPitch; },
+  get camDist() { return camDist; },
+  get pointerLocked() { return pointerLocked; },
+  level: {
+    seed: level.seed, count: level.platforms.length,
+    topY: level.topY, decorCount: level.decor.length,
+    groundW: level.platforms[0].w, groundD: level.platforms[0].d
+  },
   nav: function () {
     var i = player.groundIdx;
     var cur = level.platforms[i] || null;
     var nxt = level.platforms[Math.min(i + 1, level.platforms.length - 1)] || null;
     return {
-      idx: i, onGround: player.onGround, camYaw: camYaw,
+      idx: i, onGround: player.onGround, camYaw: camYaw, camPitch: camPitch,
       px: player.x, py: player.y, pz: player.z, bestY: player.bestY, falls: player.falls,
       cur: cur ? { x: cur.x, y: cur.y, z: cur.z, w: cur.w, d: cur.d } : null,
       next: nxt ? { x: nxt.x, y: nxt.y, z: nxt.z, w: nxt.w, d: nxt.d } : null
     };
+  },
+  // Where the animal's head projects to right now, in CSS pixels. The browser
+  // gate asserts this sits inside the viewport: that is the check v1.0 lacked.
+  aimPixel: function () {
+    var o = [0, 0, 0];
+    return projectPoint(view.target.x, view.target.y, view.target.z, view, o)
+      ? { x: o[0], y: o[1], z: o[2], w: W, h: H } : null;
   }
 };
 
