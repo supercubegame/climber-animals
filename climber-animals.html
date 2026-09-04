@@ -1148,8 +1148,6 @@ function stepPlayer(s, input, level, phys) {
   const solved = resolveSides(nx, y, nz, level, P.PLAYER_R);
   if (solved.x !== nx || solved.z !== nz) {
     bumped = 1;
-    // Kill the velocity component that drove us in, or we grind along the wall
-    // re-penetrating it every step and the movement feels sticky.
     if (solved.x !== nx) vx = 0;
     if (solved.z !== nz) vz = 0;
     nx = solved.x; nz = solved.z;
