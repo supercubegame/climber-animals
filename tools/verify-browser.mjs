@@ -19,8 +19,8 @@ let pass = 0, fail = 0;
 const log = (s) => { lines.push(s); console.log(s); };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function record(name, ok, detail) {
-  if (ok) { pass++; log(`[PASS] ${name}${detail ? ' — ' + detail : ''}`); }
-  else { fail++; log(`[FAIL] ${name}${detail ? ' — ' + detail : ''}`); }
+  if (ok) { pass++; log(`[PASS] ${name}${detail ? ' \u2014 ' + detail : ''}`); }
+  else { fail++; log(`[FAIL] ${name}${detail ? ' \u2014 ' + detail : ''}`); }
 }
 function finish() {
   log('');
@@ -38,11 +38,11 @@ try { puppeteer = (await import('puppeteer')).default; }
 catch {
   // Not "skip". A missing browser means this run verified NOTHING, and that must
   // not look like health.
-  log('[FAIL] env:puppeteer-available — puppeteer is not installed, so NO browser behaviour was verified this run (this is not a pass and not a skip)');
+  log('[FAIL] env:puppeteer-available \u2014 puppeteer is not installed, so NO browser behaviour was verified this run (this is not a pass and not a skip)');
   fail++; finish();
 }
 
-log('=== Climber Animals — browser gate ===');
+log('=== Climber Animals \u2014 browser gate ===');
 const url = pathToFileURL(join(ROOT, 'climber-animals.html')).href;
 log(`loading ${url}`);
 if (!existsSync(SHOTS)) mkdirSync(SHOTS, { recursive: true });
@@ -71,15 +71,23 @@ await page.waitForFunction('window.__game && window.__game.ticks > 30', { timeou
 // (the 2x2 is orthonormal, so the inverse is its transpose)
 const HOLD_BAND = 0.30;   // treat an axis as "pressed" past this much of the unit vector
 const EASE_RADIUS = 1.0;  // inside this distance to the target, release the sticks
-const EDGE_MARGIN = 0.8;  // jump once this close to the platform's far edge
+const EDGE_MARGIN = 0.9;  // jump once this close to the edge you are walking toward
 const POLL_MS = 35;
 
-// Standing room from a platform centre along (dx,dz): the ray-box exit distance.
-// Same maths as src/core/level.mjs rayExitXZ, deliberately re-stated here because
-// the gate must not import the thing it is grading.
-function rayExit(w, d, dx, dz) {
-  const ax = Math.abs(dx), az = Math.abs(dz);
-  return Math.min(ax > 1e-9 ? (w / 2) / ax : Infinity, az > 1e-9 ? (d / 2) / az : Infinity);
+// Distance from an INTERIOR point to the box edge, along the direction of travel.
+// Test-side navigation, deliberately not imported from the core: the gate must
+// not lean on the thing it is grading.
+//
+// The previous version projected the player's position onto the bearing to the
+// target and compared it against the ray exit along that same bearing. Movement
+// is 8-way quantised, so the actual travel direction is up to 22.5 degrees off
+// that bearing; on the 26-unit farmyard the animal walked off the z edge while
+// the projection still read 12 of 16 and the jump never fired. CI reported it as
+// "Space asked for on 0 polls, 7 falls, 0 platforms". See docs/PITFALLS.md.
+function distToEdge(box, px, pz, dx, dz) {
+  const tx = Math.abs(dx) < 1e-9 ? Infinity : ((dx > 0 ? box.x + box.w / 2 : box.x - box.w / 2) - px) / dx;
+  const tz = Math.abs(dz) < 1e-9 ? Infinity : ((dz > 0 ? box.z + box.d / 2 : box.z - box.d / 2) - pz) / dz;
+  return Math.max(0, Math.min(tx, tz));
 }
 
 async function autopilot(page, ms, { pressKeys = true } = {}) {
@@ -108,14 +116,22 @@ async function autopilot(page, ms, { pressKeys = true } = {}) {
           if (f > HOLD_BAND) want.add('KeyW'); else if (f < -HOLD_BAND) want.add('KeyS');
           if (r > HOLD_BAND) want.add('KeyD'); else if (r < -HOLD_BAND) want.add('KeyA');
         }
-        // Jump only near the far edge. Holding Space from the platform centre
-        // looks like a bunny hop but lands you in the gap: the arc peaks before
-        // the gap starts. This is what the offline replay proved before this
-        // ever ran in a browser -- see docs/PITFALLS.md.
+        // Jump only when the edge you are walking toward is close. Holding Space
+        // from the middle of a platform looks like a bunny hop but lands you in
+        // the gap: the arc peaks before the gap even starts.
         if (n.onGround && n.cur) {
-          const exit = rayExit(n.cur.w, n.cur.d, dx, dz);
-          const offset = (n.px - n.cur.x) * dx + (n.pz - n.cur.z) * dz;
-          if (offset >= exit - EDGE_MARGIN) { want.add('Space'); jumpPolls++; }
+          // Where the quantised keys will actually send us, which is not the same
+          // as the bearing to the target.
+          let mx = 0, mz = 0;
+          const sy2 = Math.sin(n.camYaw), cy2 = Math.cos(n.camYaw);
+          const fwd = (want.has('KeyW') ? 1 : 0) - (want.has('KeyS') ? 1 : 0);
+          const rgt = (want.has('KeyD') ? 1 : 0) - (want.has('KeyA') ? 1 : 0);
+          mx = fwd * sy2 + rgt * cy2;
+          mz = fwd * cy2 - rgt * sy2;
+          const ml = Math.hypot(mx, mz);
+          if (ml > 1e-9 && distToEdge(n.cur, n.px, n.pz, mx / ml, mz / ml) <= EDGE_MARGIN) {
+            want.add('Space'); jumpPolls++;
+          }
         }
       }
     }
@@ -148,7 +164,38 @@ metrics.ticksPer600ms = delta;
 record('loop:advances-over-time', delta >= 24,
   `+${delta} fixed steps over 600ms of wall clock (floor 24 = a third of the 72 implied by the 60.0 fps CI measured on 2026-09-04)`);
 
-// 3. canvas actually painted. Floor 20 distinct quantised colours: CI measured 44
+// 3. THE v1.0 BUG: is the animal actually on screen? v1.0 rendered it 83px below
+//    the bottom edge, which read as "there is no third-person model" / "it must be
+//    first person". Nothing in the gate could see it, because the camera maths
+//    lived in the shell where nothing could reach it.
+const aim0 = await page.evaluate(() => window.__game.aimPixel());
+metrics.aimPixel = aim0 ? `${Math.round(aim0.x)},${Math.round(aim0.y)} of ${aim0.w}x${aim0.h}` : 'null';
+const aimOk = !!aim0 && aim0.x > 60 && aim0.x < aim0.w - 60 && aim0.y > 60 && aim0.y < aim0.h - 60;
+record('camera:animal-is-on-screen', aimOk,
+  aim0
+    ? `aim point at ${Math.round(aim0.x)},${Math.round(aim0.y)} in a ${aim0.w}x${aim0.h} viewport, ${Math.round(Math.min(aim0.x, aim0.w - aim0.x, aim0.y, aim0.h - aim0.y))}px clear of the nearest edge (v1.0 put it at y=935 of 852)`
+    : 'aimPixel() returned null: the camera target is behind the near plane');
+
+// 4. the farmyard is drawn. v1.0's all-or-nothing near culling would have thrown
+//    the whole ground plane away; here we count green pixels in the lower half.
+const grass = await page.evaluate(() => {
+  const c = document.getElementById('view');
+  const g = c.getContext('2d');
+  let green = 0, n = 0;
+  for (let ix = 0; ix < 40; ix++) {
+    for (let iy = 14; iy < 25; iy++) {   // lower ~45% of the frame
+      const d = g.getImageData(Math.floor((ix + 0.5) * c.width / 40), Math.floor((iy + 0.5) * c.height / 25), 1, 1).data;
+      if (d[1] > d[2] + 20 && d[1] > 90) green++;
+      n++;
+    }
+  }
+  return { green, n };
+});
+metrics.grassPixelPct = +(100 * grass.green / grass.n).toFixed(1);
+record('render:farmyard-is-drawn', grass.green / grass.n > 0.35,
+  `${grass.green}/${grass.n} samples in the lower frame read as grass (${(100 * grass.green / grass.n).toFixed(0)}%, floor 35%). The core says the ground covers 45-98% of the viewport depending on pitch.`);
+
+// 5. canvas actually painted. Floor 20 distinct quantised colours: CI measured 44
 //    on 2026-09-04, and this is the check that proves geometry is drawn rather
 //    than just "the file is not empty" (that is the screenshot size check).
 const paint = await page.evaluate(() => {
@@ -169,42 +216,92 @@ metrics.distinctColours = paint.distinct;
 record('render:canvas-not-blank', paint.distinct >= 20,
   `${paint.distinct} distinct colours across ${paint.samples} samples at ${paint.w}x${paint.h} (floor 20, measured 44)`);
 
-// 4. CONTROL: same steering maths, no keys sent. Nothing may move. Without this,
+// 6. CONTROL: same steering maths, no keys sent. Nothing may move. Without this,
 //    the climb below could be coming from anywhere and the gate would not know.
-const control = await autopilot(page, 3000, { pressKeys: false });
+const control = await autopilot(page, 3500, { pressKeys: false });
 metrics.controlMaxIdx = control.maxIdx;
 metrics.controlBestY = +control.end.bestY.toFixed(2);
 record('input:control-run-does-not-move', control.maxIdx === 0 && control.end.bestY < 0.01,
   control.maxIdx === 0 && control.end.bestY < 0.01
-    ? `3s of steering with the keyboard muted: still on platform 0 at ${control.end.bestY.toFixed(2)}m over ${control.samples} samples ⇒ the climb below is the key path, not something else`
-    : `the animal moved with NO keys pressed: idx ${control.maxIdx}, best ${control.end.bestY.toFixed(2)}m — something other than input is driving it`);
+    ? `3.5s of steering with the keyboard muted: still on platform 0 at ${control.end.bestY.toFixed(2)}m over ${control.samples} samples \u21d2 the climb below is the key path, not something else`
+    : `the animal moved with NO keys pressed: idx ${control.maxIdx}, best ${control.end.bestY.toFixed(2)}m \u2014 something other than input is driving it`);
 
-// 5. the real thing: climb a real stretch of the actual tower
-const run = await autopilot(page, 20000, { pressKeys: true });
+// 7. the real thing: climb a real stretch of the actual tower
+const run = await autopilot(page, 24000, { pressKeys: true });
 metrics.autopilotMaxIdx = run.maxIdx;
 metrics.autopilotBestY = +run.end.bestY.toFixed(2);
 metrics.autopilotFalls = run.end.falls;
 metrics.autopilotJumpPolls = run.jumpPolls;
 metrics.autopilotSamples = run.samples;
-metrics.autopilotPollMs = Math.round(20000 / Math.max(1, run.samples));
+metrics.autopilotPollMs = Math.round(24000 / Math.max(1, run.samples));
 // MEASURED, not guessed: an offline replay of this exact controller against the
-// pure core reaches platform 20 / 19.55m in 20s with zero falls, and holds ~20
-// from 20ms to 90ms polling. Floors are set at half that. It degrades hard past
-// ~140ms per poll, so if this ever goes red check autopilotPollMs first.
-const CLIMB_IDX_FLOOR = 10;
-const CLIMB_Y_FLOOR = 9;
+// pure core reaches platform 23 / 23.6m in 24s with zero falls, and holds 22-23
+// across every poll interval from 20ms to 140ms. Floors are half that. The 24s
+// budget includes ~4s of walking across the farmyard before the first jump.
+const CLIMB_IDX_FLOOR = 11;
+const CLIMB_Y_FLOOR = 11;
 const climbed = run.maxIdx >= CLIMB_IDX_FLOOR && run.end.bestY >= CLIMB_Y_FLOOR;
 record('input:autopilot-climbs-the-tower', climbed,
-  `reached platform #${run.maxIdx} / ${run.end.bestY.toFixed(2)}m in 20s via real keys ` +
-  `(Space asked for on ${run.jumpPolls} polls, ${run.end.falls} falls, ${run.samples} samples \u2248 ${Math.round(20000 / Math.max(1, run.samples))}ms per poll). ` +
-  `Floors idx ${CLIMB_IDX_FLOOR} / ${CLIMB_Y_FLOOR}m = half the offline-measured 20 / 19.55.`);
+  `reached platform #${run.maxIdx} / ${run.end.bestY.toFixed(2)}m in 24s via real keys ` +
+  `(Space asked for on ${run.jumpPolls} polls, ${run.end.falls} falls, ${run.samples} samples \u2248 ${Math.round(24000 / Math.max(1, run.samples))}ms per poll). ` +
+  `Floors idx ${CLIMB_IDX_FLOOR} / ${CLIMB_Y_FLOOR}m = half the offline-measured 23 / 23.6.`);
 
 const after = await page.evaluate(() => ({ fps: window.__game.fps }));
 metrics.fps = +after.fps.toFixed(1);
 record('loop:fps-alive', after.fps > 5,
   `${after.fps.toFixed(1)} fps (floor 5 = dead-loop detector only, NOT a benchmark; CI is software-rendered)`);
 
-// 6. HUD is wired to state, not just decorative
+// --- mouse look, the other thing v1.0 got wrong -------------------------------
+// A page only receives mouse movement continuously while the pointer is LOCKED;
+// without a lock it sees the cursor but the camera cannot follow it, which is why
+// v1.0 needed click-and-drag. Both paths are exercised and the report says which,
+// because "pointer lock was not granted" and "mouse look is broken" must not look
+// the same.
+const yaw0 = await page.evaluate(() => window.__game.camYaw);
+await page.mouse.click(640, 400);                      // a real gesture: arms the lock
+await sleep(300);
+const locked = await page.evaluate(() => window.__game.pointerLocked);
+metrics.pointerLockGranted = locked;
+await page.mouse.move(640, 400);
+await page.mouse.move(900, 470);                       // no button held
+await sleep(200);
+const yawLock = await page.evaluate(() => window.__game.camYaw);
+const lockTurned = Math.abs(yawLock - yaw0) > 0.05;
+
+// drag fallback, which must work whether or not the lock was granted
+await page.evaluate(() => { if (document.exitPointerLock) document.exitPointerLock(); });
+await sleep(200);
+const yaw1 = await page.evaluate(() => window.__game.camYaw);
+const p1 = await page.evaluate(() => window.__game.camPitch);
+await page.mouse.move(500, 400);
+await page.mouse.down();
+await page.mouse.move(760, 300, { steps: 8 });
+await page.mouse.up();
+await sleep(150);
+const after2 = await page.evaluate(() => ({ yaw: window.__game.camYaw, pitch: window.__game.camPitch }));
+const dragYaw = Math.abs(after2.yaw - yaw1), dragPitch = Math.abs(after2.pitch - p1);
+metrics.dragYawDelta = +dragYaw.toFixed(3);
+metrics.dragPitchDelta = +dragPitch.toFixed(3);
+record('input:mouse-look-turns-the-camera',
+  (locked ? lockTurned : true) && dragYaw > 0.2 && dragPitch > 0.05,
+  locked
+    ? `pointer lock GRANTED: bare mouse movement moved yaw by ${Math.abs(yawLock - yaw0).toFixed(3)} rad. Drag fallback also works (yaw ${dragYaw.toFixed(2)}, pitch ${dragPitch.toFixed(2)}).`
+    : `pointer lock NOT granted by this headless browser, so continuous look was NOT verified this run; the drag fallback was (yaw ${dragYaw.toFixed(2)} rad, pitch ${dragPitch.toFixed(2)} rad). Lock is the path a real Edge session takes.`);
+
+record('input:camera-pitch-is-clamped', await page.evaluate(async () => {
+  const ev = function (t, o) { window.dispatchEvent(new MouseEvent(t, o)); };
+  ev('mousedown', { clientX: 500, clientY: 400, bubbles: true });
+  for (let i = 0; i < 60; i++) ev('mousemove', { clientX: 500, clientY: 400 + i * 40, bubbles: true });
+  ev('mouseup', {});
+  const hi = window.__game.camPitch;
+  ev('mousedown', { clientX: 500, clientY: 4000, bubbles: true });
+  for (let i = 0; i < 60; i++) ev('mousemove', { clientX: 500, clientY: 4000 - i * 40, bubbles: true });
+  ev('mouseup', {});
+  const lo = window.__game.camPitch;
+  return hi <= 1.15 + 1e-9 && lo >= 0.02 - 1e-9 && hi > lo;
+}), 'dragged hard past both limits: pitch stayed inside [0.02, 1.15] and the two extremes differ');
+
+// 8. HUD is wired to state, not just decorative
 const hud = await page.evaluate(() => ({
   best: document.getElementById('h-best').textContent,
   falls: document.getElementById('h-falls').textContent,
@@ -217,29 +314,38 @@ record('hud:reflects-state', hudOk,
 
 await page.screenshot({ path: join(SHOTS, 'climbed.png') });
 
-// 7. falling costs height, from wherever the autopilot got to
-const fell = await page.evaluate(async () => {
-  const start = window.__game.state.y;
-  const ev = (t, code) => window.dispatchEvent(new KeyboardEvent(t, { code, bubbles: true }));
-  ev('keydown', 'KeyD');
-  await new Promise((r) => setTimeout(r, 4000));
-  ev('keyup', 'KeyD');
-  return { start, end: window.__game.state.y, falls: window.__game.state.falls };
-});
-metrics.fellFrom = +fell.start.toFixed(2);
-metrics.fellTo = +fell.end.toFixed(2);
-record('genre:falling-costs-height', fell.end < fell.start - 0.3,
-  `walked off from ${fell.start.toFixed(2)}m → ${fell.end.toFixed(2)}m (no checkpoint caught it)`);
+// 9. falling costs height, from wherever the autopilot got to.
+//     CASCADE GUARD: this walks off an edge and expects to lose height, which is
+//     impossible if the autopilot never left the ground. When that happened it
+//     reported as a SECOND independent failure, so one broken jump trigger read
+//     as two bugs. A dependent check must name its upstream cause instead.
+if (!climbed) {
+  record('genre:falling-costs-height', false,
+    `NOT RUN: root cause is input:autopilot-climbs-the-tower above. The animal never left the farmyard (best ${run.end.bestY.toFixed(2)}m), so there is no height to lose. Fix that check first; this one is cascade noise.`);
+} else {
+  const fell = await page.evaluate(async () => {
+    const start = window.__game.state.y;
+    const ev = (t, code) => window.dispatchEvent(new KeyboardEvent(t, { code, bubbles: true }));
+    ev('keydown', 'KeyD');
+    await new Promise((r) => setTimeout(r, 4000));
+    ev('keyup', 'KeyD');
+    return { start, end: window.__game.state.y, falls: window.__game.state.falls };
+  });
+  metrics.fellFrom = +fell.start.toFixed(2);
+  metrics.fellTo = +fell.end.toFixed(2);
+  record('genre:falling-costs-height', fell.end < fell.start - 0.3,
+    `walked off from ${fell.start.toFixed(2)}m \u2192 ${fell.end.toFixed(2)}m (no checkpoint caught it)`);
+}
 
-// 8. species switch through the real key path
+// 10. species switch through the real key path
 const sp = await page.evaluate(async () => {
   window.dispatchEvent(new KeyboardEvent('keydown', { code: 'Digit2', bubbles: true }));
   await new Promise((r) => setTimeout(r, 200));
   return window.__game.state.speciesId;
 });
-record('input:species-switch', sp === 'chicken', `Digit2 → speciesId "${sp}"`);
+record('input:species-switch', sp === 'chicken', `Digit2 \u2192 speciesId "${sp}"`);
 
-// 9. screenshot exists at all. Deliberately left loose at 9000 bytes: a flat
+// 11. screenshot exists at all. Deliberately left loose at 9000 bytes: a flat
 //    colour 1280x800 PNG compresses to 12-19KB, so a tighter byte floor would be
 //    a false-red factory. Measured 104957. Image QUALITY is the colour check
 //    above; this one only catches an empty capture, and says so.
