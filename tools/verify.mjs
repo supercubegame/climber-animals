@@ -8,7 +8,7 @@ import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { mulberry32 } from '../src/core/rng.mjs';
-import { makeLevel, extentAlong } from '../src/core/level.mjs';
+import { makeLevel, extentAlong, rayExitXZ } from '../src/core/level.mjs';
 import { makePlayer, stepPlayer, hashState, isFinitePlayer, DEFAULT_PHYS, SPECIES } from '../src/core/player.mjs';
 import { scanReachability } from '../src/core/reach.mjs';
 import * as K from '../src/core/constants.mjs';
@@ -131,6 +131,62 @@ check('reach:every-segment-playable', () => {
     return { ok: false, detail: `${bad.length}/${total} segments unreachable. First few:\n      ` + bad.slice(0, 5).join('\n      ') };
   }
   return { ok: true, detail: `${total} segments, all landed. min peak clearance ${minClr.toFixed(3)}, longest flight ${maxSteps} steps of ${600} cap` };
+});
+
+check('reach:launch-point-is-standable', () => {
+  // The scan launches every hop from the far edge of the platform. If that point
+  // is not actually ON the platform, the scan has been measuring hops that start
+  // in mid-air, closer to the target than any player could get. It did exactly
+  // that until 2026-09-04: extentAlong (a projection width) was used where the
+  // ray-box exit distance was needed.
+  let off = 0, total = 0;
+  for (const sd of SEEDS) {
+    for (const seg of scanReachability(makeLevel(sd)).segments) {
+      const L = seg.launch;
+      total++;
+      if (Math.abs(L.dx * L.offset) > L.hw + 1e-9 || Math.abs(L.dz * L.offset) > L.hd + 1e-9) off++;
+    }
+  }
+  // Discrimination test: the old formula must be caught by this very check,
+  // otherwise it is not measuring anything.
+  const ref = scanReachability(makeLevel(K.DEFAULT_SEED)).segments;
+  let wouldCatch = 0;
+  for (const seg of ref) {
+    const L = seg.launch;
+    const alt = extentAlong(L.hw * 2, L.hd * 2, L.dx, L.dz);
+    if (Math.abs(L.dx * alt) > L.hw + 1e-9 || Math.abs(L.dz * alt) > L.hd + 1e-9) wouldCatch++;
+  }
+  metrics.offPlatformLaunches = off;
+  metrics.oldFormulaWouldBeCaught = `${wouldCatch}/${ref.length}`;
+  if (off > 0) return { ok: false, detail: `${off}/${total} hops launch from a point outside the platform footprint` };
+  if (wouldCatch === 0) return { ok: false, detail: 'this check cannot even catch the extentAlong bug it exists for — it is vacuous' };
+  return { ok: true, detail: `${total} launch points all within the platform footprint; the old extentAlong formula would be caught on ${wouldCatch}/${ref.length} of them` };
+});
+
+check('geom:rayexit-differs-from-extent', () => {
+  // Guards the pair against being "simplified" back into one function.
+  //
+  // First version of this check compared a 7x7 box along an exact 45 degree
+  // diagonal and got 4.950 vs 4.950. On a SQUARE at exactly 45 degrees the two
+  // formulas coincide -- of all the angles available I picked the one where the
+  // check proves nothing. Sweep angles instead of trusting one sample.
+  let worstGap = 0, worstAt = '';
+  for (let deg = 0; deg <= 90; deg += 1) {
+    const rad = (deg * Math.PI) / 180;
+    const dx = Math.sin(rad), dz = Math.cos(rad);
+    for (const [w, d] of [[7, 7], [6, 2], [2.2, 1.7], [3.4, 3.2]]) {
+      const e = extentAlong(w, d, dx, dz), r = rayExitXZ(w, d, dx, dz);
+      // Standing room can never exceed the projection width.
+      if (r > e + 1e-9) return { ok: false, detail: `rayExit ${r} > extentAlong ${e} on ${w}x${d} at ${deg}deg — impossible, one is wrong` };
+      if (e - r > worstGap) { worstGap = e - r; worstAt = `${w}x${d} at ${deg}deg (${e.toFixed(2)} vs ${r.toFixed(2)})`; }
+    }
+  }
+  // Axis-aligned they must agree exactly, or rayExit is not a ray exit.
+  const ae = extentAlong(7, 7, 1, 0), ar = rayExitXZ(7, 7, 1, 0);
+  metrics.worstExtentVsRayGap = +worstGap.toFixed(3);
+  if (Math.abs(ae - ar) > 1e-9) return { ok: false, detail: `axis-aligned they must agree, got ${ae} vs ${ar}` };
+  if (worstGap < 0.3) return { ok: false, detail: `the two formulas never diverge by more than ${worstGap.toFixed(3)} across the sweep — they have been collapsed into one` };
+  return { ok: true, detail: `swept 91 angles x 4 box shapes: they agree on axis (${ae}), diverge by up to ${worstGap.toFixed(2)} at ${worstAt}` };
 });
 
 check('reach:mutants-turn-it-red', () => {
@@ -287,7 +343,8 @@ check('ship:scanner-self-test', () => {
 
 check('ship:browser-gate-hooks-present', () => {
   const html = read('climber-animals.html');
-  const need = ['id="view"', 'id="h-cur"', 'id="h-best"', 'id="h-falls"', 'window.__game'];
+  const need = ['id="view"', 'id="h-cur"', 'id="h-best"', 'id="h-falls"',
+    'window.__game', 'get camYaw', 'nav: function'];
   const missing = need.filter((n) => !html.includes(n));
   return missing.length === 0
     ? { ok: true, detail: `all read points the browser gate depends on exist: ${need.join(', ')}` }
