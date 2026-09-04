@@ -342,31 +342,42 @@ record('input:drag-look-turns-pitch', !dragY.lockedAtStart && !dragY.locked && M
     ? `pointer lock was active during this drag (start ${dragY.lockedAtStart}, end ${dragY.locked}), so it measured the lock path, not the drag path. That is the failure, not the camera.`
     : `dragged 420px vertically on the canvas: pitch ${dragY.before.pitch.toFixed(3)} \u2192 ${dragY.after.pitch.toFixed(3)} (\u0394 ${dragY.dPitch.toFixed(3)}, floor 0.1); yaw moved ${dragY.dYaw.toFixed(3)}`);
 
-// D. the clamp itself. Drag far past both limits and require the bounds to hold.
-//    Separately require that the two extremes DIFFER, otherwise a camera frozen
-//    at one value would pass a bounds check trivially.
+// D. the clamp itself. Drag past both limits and require the bounds to hold.
+//    Separately require the two extremes to DIFFER, otherwise a camera frozen at
+//    one value passes a bounds check trivially.
 //
-//    One 600px drag is worth 1.08 rad of pitch, which is not guaranteed to
-//    saturate a [0.02, 1.15] range from an arbitrary start, so each direction gets
-//    two drags. The report says whether it actually reached the stop rather than
-//    claiming it did.
+//    ONE drag per direction, deliberately. Round three used two 600px drags each
+//    way and failed with pitch stuck at 0.0200 after dragging toward the MAXIMUM,
+//    which is only possible if a drag was measured under pointer lock: every
+//    mouseup fires a click, the shell arms the lock on canvas click, and the grant
+//    is asynchronous, so a rapid second drag races it. Fewer mouseups, fewer
+//    races. 700px x MOUSE_SENS_Y = 1.26 rad, which spans the whole
+//    [0.02, 1.15] range from any start, so one drag is enough.
+//
+//    The lock state is ASSERTED, not just collected. Round three already had the
+//    numbers proving lock contamination and threw them away, which is how a test
+//    defect got reported as a product defect twice.
 const PITCH_MIN = 0.02, PITCH_MAX = 1.15;
-for (let i = 0; i < 2; i++) { await dragBy(page, [640, 100], [640, 700], 20); await sleep(80); }
+const toMax = await dragBy(page, [640, 50], [640, 750], 24);   // downward drag raises pitch
 const hi = await page.evaluate(() => window.__game.camPitch);
-await sleep(120);
-for (let i = 0; i < 2; i++) { await dragBy(page, [640, 700], [640, 100], 20); await sleep(80); }
+await sleep(200);
+const toMin = await dragBy(page, [640, 750], [640, 50], 24);
 const lo = await page.evaluate(() => window.__game.camPitch);
 metrics.pitchAfterMaxDrag = +hi.toFixed(4);
 metrics.pitchAfterMinDrag = +lo.toFixed(4);
+const clampLocked = toMax.lockedAtStart || toMax.locked || toMin.lockedAtStart || toMin.locked;
+metrics.clampDragLocked = clampLocked;
 const inBounds = hi <= PITCH_MAX + 1e-9 && lo >= PITCH_MIN - 1e-9;
-const moved = hi - lo > 0.2;
-record('input:camera-pitch-is-clamped', inBounds && moved,
-  !inBounds
-    ? `pitch escaped its limits: after slamming down it read ${hi.toFixed(4)} (max ${PITCH_MAX}), after slamming up ${lo.toFixed(4)} (min ${PITCH_MIN})`
-    : !moved
-      ? `pitch barely moved between the two extremes (${lo.toFixed(4)} vs ${hi.toFixed(4)}, need >0.2 apart) \u2014 the bounds check would pass on a frozen camera, so it proves nothing`
-      : `slammed 1200px each way: pitch reached ${hi.toFixed(4)} then ${lo.toFixed(4)}, both inside [${PITCH_MIN}, ${PITCH_MAX}], ${(hi - lo).toFixed(3)} apart. ` +
-        `Stops actually hit: max ${Math.abs(hi - PITCH_MAX) < 1e-6 ? 'YES' : 'no, stopped short'}, min ${Math.abs(lo - PITCH_MIN) < 1e-6 ? 'YES' : 'no, stopped short'}.`);
+const spread = hi - lo;
+record('input:camera-pitch-is-clamped', !clampLocked && inBounds && spread > 0.2,
+  clampLocked
+    ? `pointer lock was active during a clamp drag (toMax ${toMax.lockedAtStart}/${toMax.locked}, toMin ${toMin.lockedAtStart}/${toMin.locked}), so this measured the lock path and the readings mean nothing. Test defect, not a camera defect.`
+    : !inBounds
+      ? `pitch escaped its limits: after dragging toward max it read ${hi.toFixed(4)} (cap ${PITCH_MAX}), after dragging toward min ${lo.toFixed(4)} (floor ${PITCH_MIN})`
+      : spread <= 0.2
+        ? `the two extremes came out ${spread.toFixed(4)} apart (need >0.2): ${lo.toFixed(4)} vs ${hi.toFixed(4)}. A bounds check passes trivially on a frozen camera, so this proves nothing yet.`
+        : `700px drag each way, one mouseup per direction: pitch reached ${hi.toFixed(4)} then ${lo.toFixed(4)}, both inside [${PITCH_MIN}, ${PITCH_MAX}], ${spread.toFixed(3)} apart. ` +
+          `Stops hit: max ${Math.abs(hi - PITCH_MAX) < 1e-6 ? 'YES' : `no, stopped at ${hi.toFixed(4)}`}, min ${Math.abs(lo - PITCH_MIN) < 1e-6 ? 'YES' : `no, stopped at ${lo.toFixed(4)}`}.`);
 
 // 8. HUD is wired to state, not just decorative
 const hud = await page.evaluate(() => ({
