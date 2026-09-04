@@ -12,6 +12,27 @@ export function extentAlong(w, d, dx, dz) {
   return (w / 2) * Math.abs(dx) + (d / 2) * Math.abs(dz);
 }
 
+/**
+ * How far you can actually WALK from the centre of a platform along (dx,dz)
+ * before your feet leave it: the ray-box exit distance.
+ *
+ * This is NOT extentAlong(). On a 7x7 pad heading 20 degrees off axis the
+ * projection width says 4.49 while the ray exits at 3.72, and the reachability
+ * scan used to launch every hop from the projection width -- i.e. from a point
+ * outside the pad, hanging in mid-air, closer to the target than any player can
+ * stand. Use extentAlong for SEPARATION, this for STANDING ROOM.
+ *
+ * They coincide on axis AND at exactly 45 degrees on a square, so never sanity
+ * check the pair with a single angle. Worst divergence found by sweeping: 1.41
+ * on a 6x2 box at 45 degrees.
+ */
+export function rayExitXZ(w, d, dx, dz) {
+  const ax = Math.abs(dx), az = Math.abs(dz);
+  const tx = ax > 1e-9 ? (w / 2) / ax : Infinity;
+  const tz = az > 1e-9 ? (d / 2) / az : Infinity;
+  return Math.min(tx, tz);
+}
+
 // kind -> [minSize, maxSize, minThickness, maxThickness, colour]
 const KINDS = {
   ground:     [7.0, 7.0, 0.8, 0.8, '#8fc866'],

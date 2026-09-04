@@ -1,4 +1,4 @@
-import { extentAlong } from './level.mjs';
+import { rayExitXZ } from './level.mjs';
 import { stepPlayer, DEFAULT_PHYS } from './player.mjs';
 
 // Not inlined into the HTML shell (see tools/build.mjs INLINE_ORDER): this is a
@@ -33,9 +33,12 @@ export function scanReachability(level, phys) {
     const len = Math.hypot(dx, dz) || 1;
     dx /= len; dz /= len;
 
-    const edge = extentAlong(a.w, a.d, dx, dz) - 0.02;
+    // Launch from the furthest point a player can actually STAND on, not from the
+    // box's projection width. See rayExitXZ() for why that distinction bit us.
+    const edge = Math.max(0, rayExitXZ(a.w, a.d, dx, dz) - 0.05);
+    const launchX = a.x + dx * edge, launchZ = a.z + dz * edge;
     let s = {
-      x: a.x + dx * edge, y: a.y, z: a.z + dz * edge,
+      x: launchX, y: a.y, z: launchZ,
       vx: dx * P.MOVE_SPEED, vy: 0, vz: dz * P.MOVE_SPEED,
       onGround: true, groundIdx: i,
       bestY: a.y, falls: 0, t: 0, steps: 0, won: false, speciesId: 'cow',
@@ -55,6 +58,9 @@ export function scanReachability(level, phys) {
 
     segments.push({
       from: i, to: i + 1, ok, steps, landedOn,
+      // reported so the gate can assert the launch point is somewhere a player
+      // could actually stand, instead of re-deriving the formula and drifting
+      launch: { x: launchX, z: launchZ, dx, dz, offset: edge, hw: a.w / 2, hd: a.d / 2 },
       gapY: +(b.y - a.y).toFixed(4),
       gapXZ: +b.gapXZ.toFixed(4),
       peakClearance: +(peak - b.y).toFixed(4),   // >0 means the arc cleared the target top
