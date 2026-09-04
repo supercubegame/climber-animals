@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Climber Animals: Together — v2.0</title>
+<title>Climber Animals: Together — v2.1</title>
 <style>
   html,body{margin:0;height:100%;overflow:hidden;background:#0d1b2a;
     font-family:"Segoe UI","Microsoft YaHei",system-ui,sans-serif;color:#fff;
@@ -57,8 +57,9 @@
   <div><b>Space</b>跳（只有落地时能跳）</div>
   <div><b>移动鼠标</b>转视角（点一下画面先锁定）</div>
   <div><b>Q E</b>左右转 &nbsp;<b>滚轮</b>拉远拉近</div>
-  <div><b>1 2 3 4</b>换动物 &nbsp;<b>R</b>回农场重来</div>
-  <div style="opacity:.62;margin-top:6px">没有存档点。掉下去就得重爬。</div>
+  <div><b>1 2 3 4</b>换动物（牛/鸡/羊/猪）</div>
+  <div><b>R</b>回农场重来（最高记录保留）</div>
+  <div style="opacity:.62;margin-top:6px">没有存档点。掉下去就得重爬。<br>草地无限延伸，可以随便走远。</div>
 </div>
 
 <div id="lock" class="panel">
@@ -110,12 +111,19 @@ function fnv1a(str) {
 // mutants that must turn it red. See AGENTS.md.
 
 // --- physics ---
-const GRAVITY = 26;          // units/s^2
-const JUMP_V = 11;           // launch velocity, coupled with GRAVITY + GAP_Y_MAX
-const MOVE_SPEED = 6.2;      // coupled with GAP_XZ_MAX
+// Feel pass, v2.1: gravity up and jump velocity up together, keeping
+// MAX_JUMP_HEIGHT within a few percent of its old value so the whole tower stays
+// reachable, but cutting AIR TIME. A 2.33m hop used to last 0.85s, which floats;
+// it is now 0.72s, which snaps. Air time is 2*JUMP_V/GRAVITY, so the ratio is the
+// knob and MAX_JUMP_HEIGHT (= JUMP_V^2/2G) is what the level depends on.
+// `phys:jump-is-snappier-but-the-tower-still-fits` asserts both halves, because
+// moving one without the other either breaks the level or does nothing.
+const GRAVITY = 37;          // units/s^2
+const JUMP_V = 13.2;         // launch velocity, coupled with GRAVITY + GAP_Y_MAX
+const MOVE_SPEED = 6.6;      // coupled with GAP_XZ_MAX
 const GROUND_ACCEL = 60;     // units/s^2 toward target velocity
-const AIR_ACCEL = 34;        // weaker mid-air control, coupled with GAP_XZ_MAX
-const TERMINAL_V = 34;       // downward speed cap; keeps the sweep test sane
+const AIR_ACCEL = 40;        // weaker mid-air control, coupled with GAP_XZ_MAX
+const TERMINAL_V = 40;       // downward speed cap; keeps the sweep test sane
 const PLAYER_R = 0.42;       // horizontal half-extent used for landing tests
 const FIXED_DT = 1 / 120;    // the core only ever advances by this
 const MAX_SUBSTEPS = 8;      // shell-side clamp so a stalled tab cannot warp
@@ -155,6 +163,19 @@ const CAM_PITCH_MAX = 1.15;
 const CAM_PITCH_DEFAULT = 0.30;
 const MOUSE_SENS_X = 0.0024;    // radians per pixel of pointer movement
 const MOUSE_SENS_Y = 0.0018;
+
+/**
+ * Which way a pointer delta turns the camera. Derived, and this time actually
+ * checked: the forward vector is (sin yaw cos p, -sin p, cos yaw cos p), so
+ * d/dyaw of its horizontal part is (cos yaw, 0, -sin yaw) -- which projects to
+ * SCREEN RIGHT. Therefore increasing yaw pans right, and mouse-right must ADD.
+ *
+ * v2.0 shipped `camYaw -= dx` and felt inverted. `Q`/`E` were correct, so the two
+ * input paths disagreed with each other, which is the tell. `camera:mouse-yaw-sign`
+ * pins it by projecting a probe point instead of trusting a comment.
+ */
+const YAW_PER_PIXEL = MOUSE_SENS_X;    // add this * dx to yaw
+const PITCH_PER_PIXEL = MOUSE_SENS_Y;  // add this * dy to pitch (mouse down = look down)
 
 const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
 const clampPitch = (p) => clamp(p, CAM_PITCH_MIN, CAM_PITCH_MAX);
@@ -205,13 +226,19 @@ function toCameraSpace(px, py, pz, eye, yaw, pitch, out) {
 
 const NEAR_Z = 0.12;
 
-/** Builds everything a frame needs, so the shell keeps no camera maths of its own. */
-function makeView(tx, ty, tz, yaw, pitch, dist, w, h) {
+/**
+ * Builds everything a frame needs, so the shell keeps no camera maths of its own.
+ * `lift` is how far above the feet to aim; it defaults to CAM_TARGET_LIFT but the
+ * shell scales it with the animal's height, because framing a chicken and framing
+ * a cow at the same aim point puts one of them in the wrong half of the screen.
+ */
+function makeView(tx, ty, tz, yaw, pitch, dist, w, h, lift) {
+  const L = lift === undefined ? CAM_TARGET_LIFT : lift;
   return {
-    eye: cameraEye(tx, ty + CAM_TARGET_LIFT, tz, yaw, pitch, dist),
-    yaw, pitch, dist, w, h,
+    eye: cameraEye(tx, ty + L, tz, yaw, pitch, dist),
+    yaw, pitch, dist, w, h, lift: L,
     focal: focalFor(h),
-    target: { x: tx, y: ty + CAM_TARGET_LIFT, z: tz },
+    target: { x: tx, y: ty + L, z: tz },
   };
 }
 
@@ -361,6 +388,265 @@ function screenCoverage(faces, w, h) {
   return a / (w * h);
 }
 
+// ---------------------------------------------------------------------------
+// Rotated boxes, so a body part can belong to an animal that FACES somewhere.
+// Local axes: +x is the animal's right, +z is its forward, +y is up.
+// local -> world:  wx = ox + lx*c + lz*s,  wz = oz - lx*s + lz*c
+// world -> local:  lx = dx*c - dz*s,       lz = dx*s + dz*c   (c=cos yaw, s=sin yaw)
+//
+// Checked against the axis-aligned path two ways: at yaw 0 the output is
+// byte-identical, and at 90 degrees a 4x1 box gives the same screen silhouette as
+// an axis-aligned 1x4. Do NOT check it by comparing face `lit` values -- under
+// rotation a local +x face legitimately becomes a world -z face, so the shading
+// SHOULD differ. Same world volume means same silhouette, not same lighting.
+// ---------------------------------------------------------------------------
+
+/** A frame is an origin plus a yaw. Precompute the trig once per animal. */
+function makeFrame(x, y, z, yaw) {
+  return { x, y, z, yaw, c: Math.cos(yaw), s: Math.sin(yaw) };
+}
+
+function localToWorld(frame, lx, ly, lz, out) {
+  out[0] = frame.x + lx * frame.c + lz * frame.s;
+  out[1] = frame.y + ly;
+  out[2] = frame.z - lx * frame.s + lz * frame.c;
+  return out;
+}
+
+const _lw = [0, 0, 0];
+const _c2 = [0, 0, 0];
+
+/**
+ * Screen faces for a box given in FRAME-LOCAL coordinates. Same near-plane clip
+ * as boxScreenFaces; back-face culling is done by moving the eye into local
+ * space, which keeps the test exact and axis-aligned.
+ */
+function localBoxScreenFaces(lx, ly, lz, w, h, d, frame, view) {
+  const eye = view.eye;
+  const dx = eye.x - frame.x, dz = eye.z - frame.z;
+  const elx = dx * frame.c - dz * frame.s;
+  const ely = eye.y - frame.y;
+  const elz = dx * frame.s + dz * frame.c;
+  const hw = w / 2, hd = d / 2;
+
+  const cam = [];
+  for (let i = 0; i < 8; i++) {
+    const cn = BOX_CORNERS[i];
+    localToWorld(frame, lx + cn[0] * hw, ly + cn[1] * h, lz + cn[2] * hd, _lw);
+    toCameraSpace(_lw[0], _lw[1], _lw[2], eye, view.yaw, view.pitch, _c2);
+    cam.push([_c2[0], _c2[1], _c2[2]]);
+  }
+
+  const faces = [];
+  for (let f = 0; f < BOX_FACES.length; f++) {
+    const face = BOX_FACES[f], n = face.n;
+    let vis;
+    if (n[1] === 1) vis = ely > ly;
+    else if (n[0] !== 0) vis = (elx - lx) * n[0] > hw;
+    else vis = (elz - lz) * n[2] > hd;
+    if (!vis) continue;
+    const clipped = clipNearZ([cam[face.idx[0]], cam[face.idx[1]], cam[face.idx[2]], cam[face.idx[3]]]);
+    if (clipped.length < 3) continue;
+    const pts = [];
+    for (let k = 0; k < clipped.length; k++) {
+      const v = clipped[k];
+      pts.push([view.w / 2 + (v[0] * view.focal) / v[2], view.h / 2 - (v[1] * view.focal) / v[2]]);
+    }
+    faces.push({ lit: face.lit, pts });
+  }
+  return faces;
+}
+
+// ---- src/core/animal.mjs ----
+// Animal models. PURE: returns posed body parts in the animal's own local space
+// (+x right, +y up, +z forward), so the shell only picks colours and fills paths
+// and the gate can assert proportions and animation without a browser.
+//
+// Everything here is COSMETIC. The collision box is PLAYER_R for every species --
+// swapping animals must not change a single physics step, which
+// `animal:species-are-cosmetic-only` proves by comparing state hashes.
+//
+// Shaping without new primitives: these are boxes, but a rounded body is a short
+// STACK of boxes whose width and depth taper, and a snout is a small box set
+// forward and low. That reads as a creature at gameplay distance; three cubes in a
+// row does not. Cost is ~20-30 boxes per animal, which is nothing next to the
+// tower.
+
+// `scale` is the only size knob. The shell scales CAMERA DISTANCE by the model
+// height so a chicken is not a speck; see updateCamera().
+const SPECIES = [
+  {
+    id: 'cow', name: 'Cow', key: '1',
+    scale: 1.15,
+    body: '#f7f3ec', spot: '#332e2a', hoof: '#2a2522', face: '#f6b8c2',
+    horn: '#e6dcc4', udder: '#f0a9b4',
+  },
+  {
+    id: 'sheep', name: 'Sheep', key: '3',
+    scale: 0.98,
+    body: '#f2ece1', spot: '#cdbfa8', hoof: '#3b342e', face: '#4a423b',
+    horn: '#d8cbb2', udder: '#e8dccb',
+  },
+  {
+    id: 'pig', name: 'Pig', key: '4',
+    scale: 0.94,
+    body: '#f2a7b2', spot: '#d97e91', hoof: '#8d5560', face: '#e8879a',
+    horn: '#f2a7b2', udder: '#e8879a',
+  },
+  {
+    id: 'chicken', name: 'Chicken', key: '2',
+    scale: 0.78,
+    body: '#f8e79a', spot: '#e3a92c', hoof: '#e0a52c', face: '#e5493a',
+    horn: '#e5493a', udder: '#f8e79a',
+  },
+];
+
+function speciesById(id) {
+  for (let i = 0; i < SPECIES.length; i++) if (SPECIES[i].id === id) return SPECIES[i];
+  return SPECIES[0];
+}
+
+/**
+ * Pose parameters, all derived from state the CORE owns so a replay looks
+ * identical:
+ *   gait    0..1 phase of the walk cycle, advanced by DISTANCE not time, so the
+ *           legs never skate when speed changes
+ *   speed01 0..1 how fast, for stride amplitude
+ *   air     0 grounded, 1 airborne
+ *   squash  0 rest, 1 fully compressed (landing) or negative (stretched, rising)
+ */
+function makePose(gait, speed01, air, squash) {
+  return { gait, speed01, air, squash };
+}
+
+const TAU = Math.PI * 2;
+
+/** Returns [{ x,y,z,w,h,d,color,tag }] in local space, y measured up from the feet. */
+function animalParts(sp, pose) {
+  const k = sp.scale;
+  const S = (n) => n * k;
+  const out = [];
+  const add = (x, y, z, w, h, d, color, tag) =>
+    out.push({ x: S(x), y: S(y), z: S(z), w: S(w), h: S(h), d: S(d), color, tag: tag || '' });
+
+  const swing = Math.sin(pose.gait * TAU) * 0.34 * pose.speed01;
+  const swingB = Math.sin(pose.gait * TAU + Math.PI) * 0.34 * pose.speed01;
+  // Airborne: front legs reach forward, back legs trail. Reads as a leap rather
+  // than a statue that happens to be off the ground.
+  const legF = pose.air ? 0.30 : swing;
+  const legB = pose.air ? -0.26 : swingB;
+  // squash>0 compresses vertically and spreads horizontally, conserving bulk.
+  const sq = 1 - pose.squash * 0.22;
+  const sp_ = 1 + pose.squash * 0.16;
+  const bob = pose.air ? 0 : Math.sin(pose.gait * TAU * 2) * 0.018 * pose.speed01;
+
+  if (sp.id === 'chicken') {
+    const legLen = 0.30;
+    // y is a box's TOP (see camera.mjs), so a leg of length legLen has its top at
+    // legLen and its foot at exactly 0. Drawing it at y=0 buries the whole leg.
+    add(-0.11, legLen, legF * 0.22, 0.07, legLen, 0.07, sp.hoof, 'legFL');
+    add(0.11, legLen, legB * 0.22, 0.07, legLen, 0.07, sp.hoof, 'legBR');
+    add(-0.11, 0.05, legF * 0.22 + 0.09, 0.16, 0.05, 0.05, sp.hoof, 'footL');
+    add(0.11, 0.05, legB * 0.22 + 0.09, 0.16, 0.05, 0.05, sp.hoof, 'footR');
+    const by = legLen + bob;
+    // body: three tapered slices, widest in the middle -> reads as a plump bird
+    add(0, by + 0.16 * sq, -0.02, 0.30 * sp_, 0.16 * sq, 0.34, sp.body, 'body');
+    add(0, by + 0.30 * sq, -0.01, 0.36 * sp_, 0.14 * sq, 0.40, sp.body, 'body');
+    add(0, by + 0.40 * sq, 0.00, 0.30 * sp_, 0.10 * sq, 0.34, sp.body, 'body');
+    add(-0.19, by + 0.30 * sq, -0.01, 0.06, 0.22, 0.30, sp.spot, 'wingL');
+    add(0.19, by + 0.30 * sq, -0.01, 0.06, 0.22, 0.30, sp.spot, 'wingR');
+    // fanned tail, three feathers of decreasing height
+    add(0, by + 0.44 * sq, -0.24, 0.05, 0.20, 0.14, sp.spot, 'tail');
+    add(-0.07, by + 0.40 * sq, -0.22, 0.05, 0.16, 0.12, sp.spot, 'tail');
+    add(0.07, by + 0.40 * sq, -0.22, 0.05, 0.16, 0.12, sp.spot, 'tail');
+    const hy = by + 0.62 * sq;
+    add(0, hy, 0.10, 0.10, 0.16, 0.10, sp.body, 'neck');
+    add(0, hy + 0.16, 0.12, 0.20, 0.18, 0.20, sp.body, 'head');
+    add(0, hy + 0.24, 0.12, 0.06, 0.09, 0.05, sp.face, 'comb');
+    add(0, hy + 0.09, 0.22, 0.07, 0.06, 0.08, '#f0a72c', 'beak');
+    add(0, hy + 0.03, 0.19, 0.05, 0.06, 0.04, sp.face, 'wattle');
+    return { parts: out, eye: { x: 0.075, y: S(hy + 0.13), z: 0.10 }, height: S(hy + 0.24) };
+  }
+
+  // --- quadrupeds: cow, sheep, pig share a skeleton and differ in dressing ---
+  const isPig = sp.id === 'pig';
+  const isSheep = sp.id === 'sheep';
+  const legLen = isPig ? 0.26 : isSheep ? 0.30 : 0.40;
+  const bodyLen = isPig ? 0.82 : isSheep ? 0.78 : 0.90;
+  const bodyW = isPig ? 0.52 : isSheep ? 0.54 : 0.56;
+  const legW = isPig ? 0.15 : 0.13;
+
+  const lz = bodyLen * 0.30;
+  for (const [sx, sz, ph, tag] of [
+    [-1, 1, legF, 'legFL'], [1, 1, legB, 'legFR'],
+    [-1, -1, legB, 'legBL'], [1, -1, legF, 'legBR'],
+  ]) {
+    add(sx * bodyW * 0.34, legLen, sz * lz + ph * 0.20, legW, legLen, legW, sp.spot, tag);
+    add(sx * bodyW * 0.34, 0.07, sz * lz + ph * 0.20, legW + 0.02, 0.07, legW + 0.03, sp.hoof, tag + 'Hoof');
+  }
+
+  const by = legLen + bob;
+  // barrel: five slices, tapering at both ends, so the silhouette is a rounded
+  // body rather than one slab
+  const slices = isSheep
+    ? [[0.10, 0.86, 0.80], [0.26, 1.00, 1.00], [0.42, 1.00, 0.98], [0.55, 0.84, 0.84], [0.64, 0.58, 0.62]]
+    : [[0.09, 0.84, 0.86], [0.24, 1.00, 1.00], [0.40, 0.98, 0.98], [0.52, 0.82, 0.86], [0.60, 0.56, 0.64]];
+  for (const [yy, ww, dd] of slices) {
+    add(0, by + yy * sq, 0, bodyW * ww * sp_, 0.17 * sq, bodyLen * dd, sp.body, 'body');
+  }
+  if (isSheep) {
+    // wool clumps break up the straight back
+    add(-0.16, by + 0.70 * sq, 0.16, 0.24, 0.16, 0.24, sp.body, 'wool');
+    add(0.17, by + 0.68 * sq, -0.10, 0.22, 0.15, 0.22, sp.body, 'wool');
+    add(0, by + 0.70 * sq, -0.26, 0.26, 0.14, 0.20, sp.body, 'wool');
+  } else {
+    add(-0.13, by + 0.50 * sq, 0.16, 0.26, 0.13, 0.24, sp.spot, 'patch');
+    add(0.16, by + 0.34 * sq, -0.14, 0.22, 0.12, 0.22, sp.spot, 'patch');
+  }
+  if (!isPig && !isSheep) add(0, by + 0.05, -0.02, 0.26, 0.14, 0.22, sp.udder, 'udder');
+
+  // tail: segmented so it can curl (pig) or hang with a tuft (cow)
+  const tz = -bodyLen * 0.52;
+  const wag = Math.sin(pose.gait * TAU + 1.1) * 0.10 * (0.4 + pose.speed01);
+  if (isPig) {
+    add(wag * 0.5, by + 0.46 * sq, tz - 0.04, 0.07, 0.07, 0.08, sp.spot, 'tail');
+    add(0.06 + wag * 0.5, by + 0.52 * sq, tz - 0.09, 0.07, 0.07, 0.07, sp.spot, 'tail');
+    add(-0.01 + wag * 0.5, by + 0.56 * sq, tz - 0.05, 0.06, 0.06, 0.07, sp.spot, 'tail');
+  } else {
+    add(wag, by + 0.44 * sq, tz - 0.03, 0.08, 0.34, 0.08, sp.spot, 'tail');
+    add(wag * 1.4, by + 0.14, tz - 0.05, 0.11, 0.13, 0.11, sp.spot, 'tailTuft');
+  }
+
+  // head, carried a little lower and further forward when moving fast
+  const lean = pose.speed01 * 0.05;
+  const hz = bodyLen * 0.50 + 0.10;
+  const hy = by + (isPig ? 0.44 : isSheep ? 0.50 : 0.52) * sq - lean;
+  add(0, hy + 0.18, hz - 0.14, 0.30, 0.22, 0.24, sp.body, 'neck');
+  add(0, hy + 0.30, hz, 0.40, 0.32, 0.34, sp.body, 'head');
+  if (isPig) {
+    add(0, hy + 0.16, hz + 0.15, 0.26, 0.14, 0.12, sp.face, 'snout');
+    add(-0.14, hy + 0.34, hz + 0.04, 0.13, 0.14, 0.10, sp.spot, 'earL');
+    add(0.14, hy + 0.34, hz + 0.04, 0.13, 0.14, 0.10, sp.spot, 'earR');
+  } else if (isSheep) {
+    add(0, hy + 0.22, hz + 0.10, 0.24, 0.20, 0.14, sp.face, 'muzzle');
+    add(0, hy + 0.38, hz - 0.02, 0.34, 0.12, 0.24, sp.body, 'woolCap');
+    add(-0.20, hy + 0.26, hz - 0.02, 0.12, 0.08, 0.16, sp.face, 'earL');
+    add(0.20, hy + 0.26, hz - 0.02, 0.12, 0.08, 0.16, sp.face, 'earR');
+  } else {
+    add(0, hy + 0.20, hz + 0.13, 0.28, 0.17, 0.12, sp.face, 'muzzle');
+    add(-0.20, hy + 0.30, hz - 0.04, 0.11, 0.11, 0.14, sp.spot, 'earL');
+    add(0.20, hy + 0.30, hz - 0.04, 0.11, 0.11, 0.14, sp.spot, 'earR');
+    add(-0.13, hy + 0.40, hz - 0.02, 0.09, 0.09, 0.09, sp.horn, 'hornL');
+    add(0.13, hy + 0.40, hz - 0.02, 0.09, 0.09, 0.09, sp.horn, 'hornR');
+  }
+
+  return {
+    parts: out,
+    eye: { x: S(0.10), y: S(hy + 0.26), z: S(hz + 0.17) },
+    height: S(hy + 0.40),
+  };
+}
+
 // ---- src/core/level.mjs ----
 /**
  * How far you can WALK from the centre of a box along (dx,dz) before your feet
@@ -384,10 +670,15 @@ function rayExitXZ(w, d, dx, dz) {
   return Math.min(tx, tz);
 }
 
-// The farmyard you spawn on. Big enough to read as a place rather than a pad,
-// which also means the tower's first platform is generated ~half its width out,
-// so you walk across the farm to reach the base. GROUND_SIZE is coupled to that
-// walk: the reachability scan launches hop 0 from the ground's ray exit.
+// The FARMYARD FOOTPRINT: the area scenery is placed in, and the box the
+// reachability scan launches hop 0 from. It is not the edge of the world.
+//
+// The ground plane itself is INFINITE (platform 0 carries `infinite: true`, and
+// stepPlayer treats such a platform as solid at every x/z). v2.0 had a 26x26 slab
+// with a visible edge you could walk off, which reads as a bug rather than a
+// boundary. The shell draws the grass as a tile centred on the player, so it
+// extends forever as you move; `level:ground-is-infinite` proves the physics
+// agrees with what is drawn, which is the pairing that actually matters.
 const GROUND_SIZE = 26;
 
 // kind -> [minSize, maxSize, minThickness, maxThickness, colour]
@@ -452,8 +743,17 @@ function makeDecor(rnd, towerDx, towerDz) {
   const bx = ax * (half - 3.4) + px * 2.6;
   const bz = az * (half - 3.4) + pz * 2.6;
   add('barn', bx, bz, 6.4, 4.2, 5.0, '#b5433a');
-  add('barnroof', bx, bz, 7.0, 1.3, 5.6, '#7d2f2a', 4.2);
+  // roof as two stacked slabs, narrowing upward: reads as a pitch, not a lid
+  add('barnroof', bx, bz, 7.0, 0.7, 5.6, '#7d2f2a', 4.2);
+  add('barnroof', bx, bz, 5.2, 0.7, 4.2, '#8f382e', 4.9);
   add('barndoor', bx - ax * 2.4, bz - az * 2.4, 1.9, 2.7, 1.9, '#e8d9bb');
+  add('barntrim', bx - ax * 2.42, bz - az * 2.42, 2.4, 0.22, 2.4, '#f2e6cd', 2.7);
+  // chimney: the smoke plume in the shell reads level.chimney, so the plume and the
+  // box it rises from cannot drift apart. `decor:chimney-anchors-the-smoke` asserts
+  // the anchor exists and sits on top of the chimney box.
+  const chx = bx + px * 2.0, chz = bz + pz * 2.0;
+  add('chimney', chx, chz, 0.7, 1.5, 0.7, '#8a4b3c', 4.9);
+  items.chimney = { x: chx, z: chz, top: 6.4 };
 
   // silo beside it, with a cap
   const sx = ax * (half - 2.6) - px * 5.0;
@@ -497,17 +797,73 @@ function makeDecor(rnd, towerDx, towerDz) {
     add('crown', tx, tz, 1.9 + rnd() * 0.7, 1.7 + rnd() * 0.6, 1.9 + rnd() * 0.7, '#4f9a52', th);
   }
 
-  // fence posts + rails along the rim, same wedge skipped so you can walk out
-  const N = 30;
+  // crop rows, so the yard has texture between the buildings
+  for (let row = 0; row < 3; row++) {
+    for (let i = 0; i < 6; i++) {
+      const cx = px * (4.2 + row * 1.5) - ax * (half - 5.5) + ax * i * 1.35;
+      const cz = pz * (4.2 + row * 1.5) - az * (half - 5.5) + az * i * 1.35;
+      add('crop', cx, cz, 0.5, 0.42 + rnd() * 0.2, 0.5, row === 1 ? '#6fae54' : '#7cbb5e');
+    }
+  }
+  // a cart by the barn: two wheels and a bed
+  const cx0 = bx - ax * 4.6 - px * 1.2, cz0 = bz - az * 4.6 - pz * 1.2;
+  add('cartbed', cx0, cz0, 1.9, 0.30, 1.2, '#a9793f', 0.45);
+  add('cartwheel', cx0 - px * 0.65, cz0 - pz * 0.65, 0.55, 0.55, 0.16, '#6b4a2f');
+  add('cartwheel', cx0 + px * 0.65, cz0 + pz * 0.65, 0.55, 0.55, 0.16, '#6b4a2f');
+
+  // fence posts + rails along the rim, with a proper GATE in the tower wedge:
+  // two tall posts flanking the gap, so the opening looks intended rather than
+  // like a missing section of fence.
+  const N = 34;
   for (let i = 0; i < N; i++) {
     const a = (i / N) * Math.PI * 2;
     const dx = Math.cos(a), dz = Math.sin(a);
-    if (dx * towerDx + dz * towerDz > 0.62) continue;
+    const towardTower = dx * towerDx + dz * towerDz;
+    if (towardTower > 0.62) continue;
     const r = half - 0.6;
     add('post', dx * r, dz * r, 0.2, 1.05, 0.2, '#efe7d6');
     add('rail', dx * r, dz * r, Math.abs(dz) * 1.9 + 0.16, 0.13, Math.abs(dx) * 1.9 + 0.16, '#efe7d6', 0.62);
+    add('rail', dx * r, dz * r, Math.abs(dz) * 1.9 + 0.16, 0.12, Math.abs(dx) * 1.9 + 0.16, '#e6dcc6', 0.30);
+    if (towardTower > 0.50) {
+      add('gatepost', dx * r, dz * r, 0.34, 1.75, 0.34, '#d8cbaf');
+      add('gatecap', dx * r, dz * r, 0.5, 0.18, 0.5, '#b59a72', 1.75);
+    }
   }
   return items;
+}
+
+/**
+ * Drifting clouds. Position is `x + drift * t` where t is the player's simulated
+ * time, which the CORE owns -- so the sky is animated and still perfectly
+ * deterministic. Using Date.now() here would have broken every replay assertion.
+ * `wrap` is the span the x position is taken modulo, so a cloud that sails off one
+ * side reappears on the other instead of the sky slowly emptying.
+ */
+const CLOUD_WRAP = 340;
+
+function makeClouds(rnd, topY) {
+  const clouds = [];
+  for (let i = 0; i < 34; i++) {
+    const y = 8 + rnd() * (topY + 40);
+    const scale = 0.7 + rnd() * 1.9;
+    clouds.push({
+      x: rnd() * CLOUD_WRAP - CLOUD_WRAP / 2,
+      y,
+      z: (rnd() - 0.5) * 240,
+      w: 7 * scale, h: 1.5 * scale, d: 4.2 * scale,
+      drift: 0.5 + rnd() * 1.5,          // units per simulated second, always +x
+      puffs: 2 + Math.floor(rnd() * 3),
+    });
+  }
+  return clouds;
+}
+
+/** Pure: the same t always gives the same sky. */
+function cloudX(cloud, t) {
+  const span = CLOUD_WRAP;
+  let x = cloud.x + cloud.drift * t;
+  x = ((x + span / 2) % span + span) % span - span / 2;
+  return x;
 }
 
 /**
@@ -530,6 +886,7 @@ function makeLevel(seed = DEFAULT_SEED, opts = {}) {
     i: 0, kind: 'ground', color: g[4],
     x: 0, y: 0, z: 0, w: g[0], d: g[1], h: g[2],
     gapY: 0, gapXZ: 0, label: 'Farm Yard',
+    infinite: true,   // solid at every x/z; w/d are the scenery footprint only
   });
 
   let angle = rnd() * Math.PI * 2;
@@ -574,10 +931,14 @@ function makeLevel(seed = DEFAULT_SEED, opts = {}) {
   const p1 = platforms[1] || { x: 1, z: 0 };
   const tl = Math.hypot(p1.x, p1.z) || 1;
 
+  const decor = makeDecor(rnd, p1.x / tl, p1.z / tl);
+
   return {
     seed,
     platforms,
-    decor: makeDecor(rnd, p1.x / tl, p1.z / tl),
+    decor,
+    chimney: decor.chimney || null,
+    clouds: makeClouds(rnd, top.y),
     spawn: { x: 0, y: 0, z: 0 },
     topY: top.y,
     topIndex: top.i,
@@ -593,12 +954,9 @@ const DEFAULT_PHYS = {
   TERMINAL_V, PLAYER_R, FIXED_DT, FLOOR_Y,
 };
 
-const SPECIES = [
-  { id: 'cow',     name: 'Cow',     body: '#f6f2ea', spot: '#3b3630', face: '#f9b4c0' },
-  { id: 'chicken', name: 'Chicken', body: '#f7e07a', spot: '#e0a52c', face: '#e5493a' },
-  { id: 'sheep',   name: 'Sheep',   body: '#efe9df', spot: '#c9bfae', face: '#4a423b' },
-  { id: 'pig',     name: 'Pig',     body: '#f4a7b4', spot: '#d97e91', face: '#e8879a' },
-];
+// The roster lives in animal.mjs with the models. Re-exported so the gate and the
+// shell keep one import site.
+{ SPECIES };
 
 function approach(cur, target, maxDelta) {
   if (target > cur) return Math.min(cur + maxDelta, target);
@@ -608,7 +966,13 @@ function approach(cur, target, maxDelta) {
 // Feet contact box. The 0.35 grace lets you keep a toe on the edge, which is what
 // makes an Only Up climb feel fair instead of cruel. It is NOT a collision hull:
 // platform SIDES are intentionally non-solid (see AGENTS.md invariants).
+//
+// `p.infinite` is the ground plane: solid at every x/z, so there is no invisible
+// cliff at the edge of the farmyard. Its w/d still describe the scenery footprint
+// and are used by the level generator, which is exactly why this has to be a flag
+// rather than a very large w/d -- a huge w/d would also move platform 1 miles out.
 function insideXZ(x, z, p, playerR) {
+  if (p.infinite) return true;
   const g = playerR * 0.35;
   return Math.abs(x - p.x) <= p.w / 2 + g && Math.abs(z - p.z) <= p.d / 2 + g;
 }
@@ -620,9 +984,17 @@ function makePlayer(level, speciesId = 'cow') {
     vx: 0, vy: 0, vz: 0,
     onGround: true, groundIdx: 0,
     bestY: ground.y, falls: 0, t: 0, steps: 0, won: false,
+    airFromY: ground.y,   // height at the last takeoff, for measuring a fall
+    lastDrop: 0,          // metres lost by the most recent landing
+    dist: 0,              // horizontal distance walked, drives the walk cycle
     speciesId,
   };
 }
+
+// A landing only counts as a FALL if it cost you real height. With an infinite
+// ground plane nothing teleports any more, so the old "went below FLOOR_Y" rule
+// would have counted zero forever -- a stat frozen at 0 looks like a broken HUD.
+const FALL_METRES = 2.0;
 
 /**
  * Pure: no I/O, no Date, no Math.random. Always advances exactly FIXED_DT.
@@ -634,6 +1006,10 @@ function stepPlayer(s, input, level, phys) {
   const dt = P.FIXED_DT;
 
   let { x, y, z, vx, vy, vz, onGround, groundIdx, bestY, falls, t, steps, won } = s;
+  let airFromY = s.airFromY === undefined ? y : s.airFromY;
+  let lastDrop = 0;
+  let dist = s.dist || 0;
+  const wasOnGround = onGround;
 
   let ix = input.mx || 0, iz = input.mz || 0;
   const l = Math.hypot(ix, iz);
@@ -675,18 +1051,34 @@ function stepPlayer(s, input, level, phys) {
   }
 
   let rx = nx, rz = nz, ry = ny;
+  // Safety net only. With an infinite ground plane this is unreachable, and it is
+  // kept for the case where platform 0's `infinite` flag is off (the gate's own
+  // negative control does exactly that). It no longer counts a fall itself: the
+  // landing bookkeeping below also sees onGround go true, so incrementing here too
+  // would double-count every rescue.
+  let rescued = false;
   if (ry < P.FLOOR_Y) {
     rx = level.spawn.x; rz = level.spawn.z; ry = level.platforms[0].y;
-    vx = 0; vy = 0; vz = 0; onGround = true; groundIdx = 0; falls += 1;
+    vx = 0; vy = 0; vz = 0; onGround = true; groundIdx = 0; rescued = true;
   }
 
   if (onGround && groundIdx === level.topIndex) won = true;
+
+  // Takeoff / landing bookkeeping, so "falls" and the metres lost are facts the
+  // core owns rather than something the renderer guesses at.
+  if (wasOnGround && !onGround) airFromY = y;
+  if (!wasOnGround && onGround) {
+    const drop = airFromY - ry;
+    if (rescued || drop > FALL_METRES) { falls += 1; lastDrop = Math.max(drop, 0); }
+  }
+  if (onGround) dist += Math.hypot(rx - x, rz - z);
 
   return {
     x: rx, y: ry, z: rz, vx, vy, vz,
     onGround, groundIdx,
     bestY: ry > bestY ? ry : bestY,
     falls, t: t + dt, steps: steps + 1, won,
+    airFromY, lastDrop, dist,
     speciesId: s.speciesId,
   };
 }
@@ -697,6 +1089,7 @@ function hashState(s) {
   return fnv1a([
     q(s.x), q(s.y), q(s.z), q(s.vx), q(s.vy), q(s.vz),
     s.onGround ? 1 : 0, s.groundIdx, q(s.bestY), s.falls, s.steps, s.won ? 1 : 0,
+    q(s.dist || 0),
   ].join('|'));
 }
 
@@ -710,7 +1103,7 @@ function isFinitePlayer(s) {
  * END PURE CORE. Everything below is shell: rendering, input, HUD. No physics.
  * ==========================================================================*/
 
-var BUILD_VERSION = "2.0.0";
+var BUILD_VERSION = "2.1.0";
 
 // ---------------------------------------------------------------- state
 var level = makeLevel(DEFAULT_SEED);
@@ -718,6 +1111,10 @@ var player = makePlayer(level, "cow");
 var speciesId = "cow";
 var camYaw = 0.6, camPitch = CAM_PITCH_DEFAULT, camDist = CAM_DIST_DEFAULT;
 var pointerLocked = false;
+// Visual-only animal state. Facing is smoothed toward the direction of travel so
+// the animal turns instead of snapping, and it is NOT physics: the collision box
+// is a circle of PLAYER_R whatever way the model points.
+var facing = 0.6, squash = 0, prevOnGround = true, prevVy = 0;
 var keys = Object.create(null);
 var consoleErrors = [];
 var acc = 0, last = 0, tickCount = 0, fps = 0, fpsAcc = 0, fpsN = 0;
@@ -744,8 +1141,21 @@ resize();
 // so the fast gate can assert where things land on screen; v1.0 kept them here,
 // where nothing could test them, and shipped inverted pitch signs that threw the
 // animal 83px below the bottom edge. See docs/PITFALLS.md.
+// Framing scales with the animal, so a chicken is not a speck and a cow does not
+// fill the frame. camDist is still yours to change with the wheel; this only moves
+// the DEFAULT and the aim height.
+function animalHeight() {
+  return animalParts(speciesDef(speciesId), makePose(0, 0, 0, 0)).height;
+}
 function updateCamera() {
-  view = makeView(player.x, player.y, player.z, camYaw, camPitch, camDist, W, H);
+  // Apparent size should be roughly constant across species, so distance tracks
+  // the model height. Not strictly proportional: fully proportional put the
+  // chicken camera at 6.6 units, close enough to clip through scenery, and it also
+  // erases the fact that a cow IS bigger. 0.30 + 0.68*h keeps a cow at ~11 and a
+  // chicken at ~7 while both still fill a similar slice of the frame.
+  var h = animalHeight();
+  view = makeView(player.x, player.y, player.z, camYaw, camPitch,
+    camDist * (0.30 + 0.68 * h), W, H, h * 0.70);
 }
 function toCam(px, py, pz, out) {
   return toCameraSpace(px, py, pz, view.eye, view.yaw, view.pitch, out);
@@ -816,35 +1226,84 @@ function mixHex(a, b, t) {
 }
 
 // ---------------------------------------------------------------- animal
-function speciesDef(id) {
-  for (var i = 0; i < SPECIES.length; i++) if (SPECIES[i].id === id) return SPECIES[i];
-  return SPECIES[0];
+function speciesDef(id) { return speciesById(id); }
+
+// Walk cycle phase comes from DISTANCE WALKED, not elapsed time, so the legs
+// never skate when you change speed or stop mid-stride. player.dist is core state,
+// which is also why a replay animates identically.
+var STRIDE = 1.35;
+function currentPose() {
+  var speed = Math.hypot(player.vx, player.vz);
+  var speed01 = Math.min(1, speed / MOVE_SPEED);
+  var gait = (player.dist / STRIDE) % 1;
+  return makePose(gait, speed01, player.onGround ? 0 : 1, squash);
 }
+
 function drawAnimal() {
-  var s = speciesDef(speciesId);
-  var x = player.x, y = player.y, z = player.z;
-  var bob = player.onGround ? Math.sin(player.t * 9) * 0.03 * Math.min(1, Math.hypot(player.vx, player.vz)) : 0;
-  var squash = player.onGround ? 1 : 1.1;
-  var by = y + 0.52 + bob;
-  drawBox(x, by, z, 0.70, 0.44 * squash, 0.52, s.body);            // body
-  drawBox(x, y + 0.16, z - 0.16, 0.60, 0.18, 0.20, s.spot);        // legs front
-  drawBox(x, y + 0.16, z + 0.16, 0.60, 0.18, 0.20, s.spot);        // legs back
-  drawBox(x, by + 0.42, z, 0.44, 0.36, 0.40, s.body);              // head
-  drawBox(x, by + 0.30, z + 0.16, 0.30, 0.16, 0.14, s.face);       // snout / beak
-  drawBox(x - 0.24, by + 0.50, z, 0.14, 0.14, 0.12, s.spot);       // ear L
-  drawBox(x + 0.24, by + 0.50, z, 0.14, 0.14, 0.12, s.spot);       // ear R
-  if (speciesId === "cow" || speciesId === "sheep") {
-    drawBox(x - 0.10, by + 0.02, z - 0.20, 0.22, 0.14, 0.10, s.spot);
-    drawBox(x + 0.16, by - 0.06, z + 0.18, 0.18, 0.12, 0.10, s.spot);
+  var sp = speciesDef(speciesId);
+  var model = animalParts(sp, currentPose());
+  var frame = makeFrame(player.x, player.y, player.z, facing);
+  var parts = model.parts;
+
+  // Sort the parts back to front in camera space. Without this, a snout drawn
+  // before the head it sits on top of disappears into it from some angles.
+  var ordered = [];
+  var probe = [0, 0, 0];
+  for (var i = 0; i < parts.length; i++) {
+    var pt = parts[i];
+    localToWorld(frame, pt.x, pt.y - pt.h / 2, pt.z, probe);
+    toCam(probe[0], probe[1], probe[2], _s);
+    ordered.push([_s[2], pt]);
   }
-  if (speciesId === "chicken") drawBox(x, by + 0.62, z, 0.10, 0.14, 0.20, s.face);
-  var e = [0,0,0];
-  if (project(x, by + 0.34, z + 0.19, e)) {
-    var r = Math.max(1.2, 26 / e[2]);
+  ordered.sort(function (a, b) { return b[0] - a[0]; });
+
+  for (var j = 0; j < ordered.length; j++) {
+    var q = ordered[j][1];
+    var faces = localBoxScreenFaces(q.x, q.y, q.z, q.w, q.h, q.d, frame, view);
+    for (var f = 0; f < faces.length; f++) {
+      var pts = faces[f].pts;
+      ctx.fillStyle = shade(q.color, faces[f].lit);
+      ctx.beginPath();
+      ctx.moveTo(pts[0][0], pts[0][1]);
+      for (var k = 1; k < pts.length; k++) ctx.lineTo(pts[k][0], pts[k][1]);
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
+
+  // eyes last, in local space so they ride the head when the animal turns
+  var e = [0, 0, 0], w2 = [0, 0, 0];
+  for (var side = -1; side <= 1; side += 2) {
+    localToWorld(frame, side * model.eye.x, model.eye.y, model.eye.z, w2);
+    if (!project(w2[0], w2[1], w2[2], e)) continue;
+    var r = Math.max(1.1, 22 / e[2]);
     ctx.fillStyle = "#20191a";
-    ctx.beginPath(); ctx.arc(e[0] - r * 2.1, e[1], r, 0, 6.2832); ctx.fill();
-    ctx.beginPath(); ctx.arc(e[0] + r * 2.1, e[1], r, 0, 6.2832); ctx.fill();
+    ctx.beginPath(); ctx.arc(e[0], e[1], r, 0, 6.2832); ctx.fill();
+    ctx.fillStyle = "#ffffff";
+    ctx.beginPath(); ctx.arc(e[0] - r * 0.3, e[1] - r * 0.3, r * 0.36, 0, 6.2832); ctx.fill();
   }
+}
+
+// Facing, squash and stretch. Squash is driven by the LANDING IMPACT (the vy we
+// had on the frame before touching down), so a small hop gives a small squish and
+// a long fall gives a real thud.
+function updateAnimalVisuals(dt) {
+  var speed = Math.hypot(player.vx, player.vz);
+  if (speed > 0.35) {
+    var want = Math.atan2(player.vx, player.vz);
+    var d = want - facing;
+    while (d > Math.PI) d -= 6.2831853;
+    while (d < -Math.PI) d += 6.2831853;
+    facing += d * Math.min(1, dt * 11);
+  }
+  if (player.onGround && !prevOnGround) {
+    squash = Math.min(1, Math.abs(prevVy) / 18);
+  } else if (!player.onGround) {
+    squash = -Math.min(0.5, Math.max(0, player.vy) / 26);   // stretch on the way up
+  }
+  squash += (0 - squash) * Math.min(1, dt * 9);
+  prevOnGround = player.onGround;
+  prevVy = player.vy;
 }
 
 // Landing shadow: the highest platform top strictly below the player. Purely
@@ -878,14 +1337,98 @@ var _s = [0, 0, 0];
 function collect(list, isDecor) {
   for (var i = 0; i < list.length; i++) {
     var p = list[i];
+    if (p.infinite) continue;      // drawGround() owns the ground plane
     if (Math.abs(p.y - player.y) > 62) continue;
     toCam(p.x, p.y, p.z, _s);
     if (_s[2] < 0.4 || _s[2] > 120) continue;
     order.push([_s[2], p, isDecor]);
   }
 }
+// The ground is an infinite plane in the physics, so it has to LOOK infinite too.
+// A slab centred on the player does that, and a checker of slightly darker tiles
+// SNAPPED TO THE WORLD GRID is what makes movement readable -- a plain slab that
+// follows you looks like standing still. Snapping matters: tile the grid to the
+// player instead and the pattern swims, which reads as motion sickness.
+var GROUND_TILE = 9;
+var GROUND_SPAN = 7;          // tiles each way from the player
+// Concentric slabs, largest first, each hazier than the last. One giant slab gets
+// ONE flat colour, so at 36m up the frame was a single sheet of green with no
+// perspective cue at all -- it read as a void, and the tower looked like it was
+// lying on the grass. Rings give the horizon a gradient without per-vertex shading,
+// which flat-filled polygons cannot do.
+var GROUND_RINGS = [[1600, 0.62], [700, 0.46], [300, 0.30], [120, 0.15]];
+function drawGround() {
+  var g = level.platforms[0];
+  var cx = Math.round(player.x / GROUND_TILE) * GROUND_TILE;
+  var cz = Math.round(player.z / GROUND_TILE) * GROUND_TILE;
+  for (var r = 0; r < GROUND_RINGS.length; r++) {
+    drawBox(cx, g.y, cz, GROUND_RINGS[r][0], g.h, GROUND_RINGS[r][0], g.color, 1, GROUND_RINGS[r][1]);
+  }
+  // The checker is the motion and altitude cue, so it must never vanish entirely:
+  // fading it to nothing was what left the high-altitude frame featureless. Instead
+  // the tiles GROW with height (9 units near the ground, up to ~34 high up) so the
+  // grid stays legible at any distance while the lines still converge.
+  var alt = Math.max(0, player.y);
+  var tile = GROUND_TILE * (1 + Math.min(2.8, alt / 26));
+  var fade = 1 - Math.min(0.6, alt / 120);
+  cx = Math.round(player.x / tile) * tile;
+  cz = Math.round(player.z / tile) * tile;
+  for (var i = -GROUND_SPAN; i <= GROUND_SPAN; i++) {
+    for (var j = -GROUND_SPAN; j <= GROUND_SPAN; j++) {
+      var tx = cx + i * tile, tz = cz + j * tile;
+      var gi = Math.round(tx / tile), gj = Math.round(tz / tile);
+      if (((gi + gj) & 1) === 0) continue;                       // half the cells
+      var dd = Math.hypot(tx - player.x, tz - player.z);
+      if (dd > tile * (GROUND_SPAN + 0.5)) continue;
+      drawBox(tx, g.y + 0.012, tz, tile, 0.012, tile, "#82bd5a",
+        fade, Math.min(0.5, dd / (tile * 13)));
+    }
+  }
+}
+
+// Clouds drift with player.t, which is CORE state, so the sky animates and stays
+// deterministic. Date.now() here would have broken every replay assertion.
+function drawClouds() {
+  for (var i = 0; i < level.clouds.length; i++) {
+    var c = level.clouds[i];
+    var x = cloudX(c, player.t) + Math.round(player.x / CLOUD_WRAP) * CLOUD_WRAP;
+    if (Math.abs(c.y - player.y) > 150) continue;
+    var dz = c.z - player.z, dx = x - player.x;
+    if (Math.hypot(dx, dz) > 260) continue;
+    drawBox(x, c.y, c.z, c.w, c.h, c.d, "#ffffff", 0.82, 0.16);
+    for (var k = 0; k < c.puffs; k++) {
+      var f = (k + 1) / (c.puffs + 1);
+      drawBox(x + (f - 0.5) * c.w * 0.9, c.y + c.h * 0.62, c.z + (k % 2 ? 0.3 : -0.3) * c.d,
+        c.w * 0.42, c.h * 0.8, c.d * 0.62, "#ffffff", 0.72, 0.16);
+    }
+  }
+}
+
+// Chimney smoke: puffs on a loop, each rising and swelling and fading. Anchored to
+// the chimney box the level generator placed, so the two cannot drift apart.
+var SMOKE_PUFFS = 7;
+var SMOKE_PERIOD = 3.4;
+function drawSmoke() {
+  var ch = level.chimney;
+  if (!ch) return;
+  if (Math.hypot(ch.x - player.x, ch.z - player.z) > 90 || player.y > 60) return;
+  for (var i = 0; i < SMOKE_PUFFS; i++) {
+    var age = ((player.t / SMOKE_PERIOD) + i / SMOKE_PUFFS) % 1;
+    var rise = age * 7.5;
+    var size = 0.5 + age * 1.9;
+    var fade = 0.5 * (1 - age) * (1 - age);
+    if (fade < 0.02) continue;
+    drawBox(ch.x + Math.sin(age * 5 + i) * age * 1.4, ch.top + rise,
+      ch.z + Math.cos(age * 4 + i) * age * 1.1,
+      size, size * 0.75, size, "#e8e4dd", fade, 0.1);
+  }
+}
+
 function render() {
   drawSky();
+  drawClouds();
+  drawGround();
+  drawSmoke();
   order.length = 0;
   collect(level.decor, true);
   collect(level.platforms, false);
@@ -950,8 +1493,14 @@ var MAP = { KeyW:"w", KeyA:"a", KeyS:"s", KeyD:"d", ArrowUp:"w", ArrowLeft:"a",
 window.addEventListener("keydown", function (e) {
   if (MAP[e.code]) { keys[MAP[e.code]] = true; e.preventDefault(); }
   if (e.code === "KeyR") resetRun();
-  var n = { Digit1:0, Digit2:1, Digit3:2, Digit4:3 }[e.code];
-  if (n !== undefined) setSpecies(SPECIES[n].id);
+  // Map by the species' OWN declared key, not by roster index: the roster was
+  // reordered for the model file and index-based keys silently remapped 2 and 3.
+  var want = { Digit1: "1", Digit2: "2", Digit3: "3", Digit4: "4" }[e.code];
+  if (want) {
+    for (var si = 0; si < SPECIES.length; si++) {
+      if (SPECIES[si].key === want) { setSpecies(SPECIES[si].id); break; }
+    }
+  }
 });
 window.addEventListener("keyup", function (e) { if (MAP[e.code]) keys[MAP[e.code]] = false; });
 // --- mouse look ---------------------------------------------------------------
@@ -963,9 +1512,14 @@ window.addEventListener("keyup", function (e) { if (MAP[e.code]) keys[MAP[e.code
 var elLock = document.getElementById("lock");
 var dragging = false, lastMX = 0, lastMY = 0;
 
+// Mouse right must pan the view RIGHT. v2.0 subtracted here and felt inverted,
+// while Q/E (which subtract for LEFT) were correct -- the two paths disagreeing is
+// the tell. Increasing yaw swings the view toward its own right vector; the
+// derivation is in camera.mjs and `camera:mouse-yaw-sign` checks it by projecting a
+// probe point rather than trusting either comment.
 function look(dxp, dyp) {
-  camYaw -= dxp * MOUSE_SENS_X;
-  camPitch = clampPitch(camPitch + dyp * MOUSE_SENS_Y);
+  camYaw += dxp * YAW_PER_PIXEL;
+  camPitch = clampPitch(camPitch + dyp * PITCH_PER_PIXEL);
 }
 function requestLock() {
   if (pointerLocked) return;
@@ -1026,7 +1580,7 @@ function paintPicker() {
   var h = "";
   for (var i = 0; i < SPECIES.length; i++) {
     h += '<span class="sp' + (SPECIES[i].id === speciesId ? " on" : "") + '" data-id="' +
-      SPECIES[i].id + '">' + (i + 1) + " " + SPECIES[i].name + "</span>";
+      SPECIES[i].id + '">' + SPECIES[i].key + " " + SPECIES[i].name + "</span>";
   }
   document.getElementById("splist").innerHTML = h;
 }
@@ -1046,17 +1600,11 @@ function paintHUD() {
   }
 }
 
-// Tell the player what a mistake cost. A silent 12m drop reads as a glitch; a
-// number reads as the genre.
-var wasOnGround = true, takeoffY = 0;
+// Tell the player what a mistake cost. The metres come from player.lastDrop, which
+// the CORE sets on the landing step -- the shell used to recompute it from its own
+// takeoff bookkeeping, which is a second source of truth for the same fact.
 function reportFalls() {
-  if (player.onGround && !wasOnGround) {
-    var lost = takeoffY - player.y;
-    if (lost > 1.2) toast("掉了 " + lost.toFixed(1) + " m");
-  } else if (!player.onGround && wasOnGround) {
-    takeoffY = player.y;
-  }
-  wasOnGround = player.onGround;
+  if (player.lastDrop > 0) toast("掉了 " + player.lastDrop.toFixed(1) + " m");
 }
 
 // ---------------------------------------------------------------- loop
@@ -1076,9 +1624,14 @@ function frame(now) {
     acc -= FIXED_DT; guard++; tickCount++;
   }
   if (acc > FIXED_DT * MAX_SUBSTEPS) acc = 0;
-  if (keys.q) camYaw -= 1.9 * dt;
-  if (keys.e) camYaw += 1.9 * dt;
+  // Q/E share the mouse's sign convention: E (right) ADDS, exactly like a
+  // rightward pointer delta. Keeping the two paths expressed in the same terms is
+  // what stops them drifting apart the way they did in v2.0.
+  var KEY_TURN = 1.9;
+  if (keys.q) camYaw -= KEY_TURN * dt;
+  if (keys.e) camYaw += KEY_TURN * dt;
   reportFalls();
+  updateAnimalVisuals(dt);
   if (toastT > 0) { toastT -= dt; if (toastT <= 0) elToast.style.opacity = "0"; }
   updateCamera();
   render();
