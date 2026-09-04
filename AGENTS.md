@@ -48,6 +48,15 @@ is ever wanted.
 
 **Named imports only in the core.** `import * as X` breaks the inliner.
 
+**`extentAlong` and `rayExitXZ` are not interchangeable.** The first is a
+projection width, used to keep two platforms apart. The second is how far you can
+walk before falling off. Using one where the other belongs is how every hop in
+the reachability scan came to launch from mid-air; see `docs/PITFALLS.md`.
+
+**`window.__game.nav()` returns raw numbers only.** No steering helper in shipped
+code: the gate does the maths and sends real key events, so the input path is
+under test instead of being graded against a helper written for it.
+
 **Platform sides are deliberately not solid.** Only the top surface collides,
 via a swept top-plane test between the previous and next `y`. That is why a
 terminal-velocity fall cannot tunnel through a thin hay bale, and why brushing a
@@ -67,14 +76,16 @@ without redoing the reachability numbers.
 | air time vs horizontal spacing | `MOVE_SPEED`, `AIR_ACCEL`, `GAP_XZ_MAX`, platform size ranges | `reach:every-segment-playable` |
 | fall speed vs step size | `TERMINAL_V`, `FIXED_DT` | `phys:no-tunneling-from-300m` |
 | tab stall clamp | `MAX_SUBSTEPS`, `FIXED_DT` | shell loop clamp |
-| HUD ids vs browser gate | `h-cur`, `h-best`, `h-falls`, `view`, `window.__game` | `ship:browser-gate-hooks-present` |
+| HUD ids vs browser gate | `h-cur`, `h-best`, `h-falls`, `view`, `window.__game`, `camYaw`, `nav()` | `ship:browser-gate-hooks-present` |
+| standing room vs separation | `rayExitXZ` (walkable), `extentAlong` (box separation) | `reach:launch-point-is-standable` + `geom:rayexit-differs-from-extent` |
+| autopilot tuning vs physics | `EASE_RADIUS`, `EDGE_MARGIN`, `POLL_MS`, `MOVE_SPEED`, `JUMP_V` | `input:autopilot-climbs-the-tower` |
 
 `MAX_JUMP_HEIGHT` and `GAP_Y_MAX` are **derived in code** on purpose. A
 hand-typed copy of `JUMP_V²/2G` is a number that drifts in silence.
 
 Note the guard for the first two groups is a simulation, not a formula. It
 replays every hop with the real step function, so it also catches changes to the
-collision code and the platform size tables. Four impossible variants
+collision code and the platform size tables. Deliberately impossible variants
 (`reach:mutants-turn-it-red`) must make it go red, which is what stops it from
 quietly becoming a decoration.
 
@@ -89,6 +100,8 @@ loosened, say so out loud.
 | min peak clearance over target platform | ~0.89 | arc apex above the next top surface |
 | longest flight | 95 steps | against a 600-step cap, so the cap never truncates |
 | comment-strip retention | ~0.75 | floor is 0.40; below that the scan proves little |
+| autopilot climb in 20s | platform 20 / 19.55m | offline replay against the core; floors set at half |
+| browser tick rate | 72 per 600ms | implied by 60.0 fps in CI; floor is a third of it |
 | `AGENTS.md` | see gate | hard cap 200 lines. Compress or split; do not raise it. |
 
 ## Adding a check
