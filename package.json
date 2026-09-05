@@ -6,7 +6,7 @@
   "scripts": {
     "build": "node tools/build.mjs",
     "verify": "node tools/build.mjs --check && node tools/verify.mjs",
-    "verify:browser": "node tools/verify-browser.mjs",
+    "verify:browser": "node tools/verify-browser-v4.mjs",
     "gate": "npm run verify && npm run verify:browser"
   }
 }
