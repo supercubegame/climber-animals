@@ -4,12 +4,19 @@
 // mutants that must turn it red. See AGENTS.md.
 
 // --- physics ---
-export const GRAVITY = 26;          // units/s^2
-export const JUMP_V = 11;           // launch velocity, coupled with GRAVITY + GAP_Y_MAX
-export const MOVE_SPEED = 6.2;      // coupled with GAP_XZ_MAX
+// Feel pass, v2.1: gravity up and jump velocity up together, keeping
+// MAX_JUMP_HEIGHT within a few percent of its old value so the whole tower stays
+// reachable, but cutting AIR TIME. A 2.33m hop used to last 0.85s, which floats;
+// it is now 0.72s, which snaps. Air time is 2*JUMP_V/GRAVITY, so the ratio is the
+// knob and MAX_JUMP_HEIGHT (= JUMP_V^2/2G) is what the level depends on.
+// `phys:jump-is-snappier-but-the-tower-still-fits` asserts both halves, because
+// moving one without the other either breaks the level or does nothing.
+export const GRAVITY = 37;          // units/s^2
+export const JUMP_V = 13.2;         // launch velocity, coupled with GRAVITY + GAP_Y_MAX
+export const MOVE_SPEED = 6.6;      // coupled with GAP_XZ_MAX
 export const GROUND_ACCEL = 60;     // units/s^2 toward target velocity
-export const AIR_ACCEL = 34;        // weaker mid-air control, coupled with GAP_XZ_MAX
-export const TERMINAL_V = 34;       // downward speed cap; keeps the sweep test sane
+export const AIR_ACCEL = 40;        // weaker mid-air control, coupled with GAP_XZ_MAX
+export const TERMINAL_V = 40;       // downward speed cap; keeps the sweep test sane
 export const PLAYER_R = 0.42;       // horizontal half-extent used for landing tests
 export const FIXED_DT = 1 / 120;    // the core only ever advances by this
 export const MAX_SUBSTEPS = 8;      // shell-side clamp so a stalled tab cannot warp
